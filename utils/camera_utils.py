@@ -23,6 +23,7 @@ from scene.cameras import Camera
 from scene.dataset_readers import CameraInfo
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+import pyexr
 
 WARNED = False
 

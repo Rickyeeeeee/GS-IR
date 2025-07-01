@@ -18,6 +18,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 from PIL import Image
 from plyfile import PlyData, PlyElement
+import pyexr
 
 from scene.colmap_loader import (
     qvec2rotmat,
@@ -232,7 +233,12 @@ def readCamerasFromTransforms(
     fovx = contents["camera_angle_x"]
     frames = contents["frames"]
     for idx, frame in enumerate(frames):
-        cam_name = os.path.join(path, frame["file_path"] + extension)
+        if extension == ".exr":
+            cam_name = os.path.join(path, frame["file_path"] + '_rgb.exr')
+        elif extension == ".png":
+            cam_name = os.path.join(path, frame["file_path"] + '_rgba.png')
+        else:
+            raise ValueError(f"Unsupported image extension: {extension}")
 
         # NeRF 'transform_matrix' is a camera-to-world transform
         c2w = np.array(frame["transform_matrix"])
@@ -246,7 +252,16 @@ def readCamerasFromTransforms(
 
         image_path = os.path.join(path, cam_name)
         image_name = Path(cam_name).stem
-        image = Image.open(image_path)
+        if extension == ".exr":
+            exr = pyexr.open(image_path)
+            # Convert to pil image
+            data = exr.get()
+            ldr = np.clip(data * 255, 0, 255).astype(np.uint8)
+            image = Image.fromarray(ldr, mode="RGB")
+        elif extension == ".png":
+            image = Image.open(image_path)
+        else:
+            raise ValueError(f"Unsupported image extension: {extension}")
 
         # im_data = np.array(image.convert("RGBA"))
 
@@ -283,11 +298,11 @@ def readNerfSyntheticInfo(
 ) -> SceneInfo:
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(
-        path, "transforms_train.json", white_background, extension
+        path, "transforms_train.json", white_background, ".exr"
     )
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(
-        path, "transforms_test.json", white_background, extension
+        path, "transforms_test.json", white_background, ".png"
     )
 
     if not eval:

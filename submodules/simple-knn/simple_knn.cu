@@ -20,6 +20,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/sequence.h>
 #include <vector>
+#include <cfloat>
 #define __CUDACC__
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>

@@ -1,6 +1,7 @@
 #pragma once
 #include <math.h>
 #include <vector_functions.h>
+#include <cstdint>
 #include <vector_types.h>
 
 constexpr uint32_t THREADS = 1024;

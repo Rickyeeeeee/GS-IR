@@ -171,7 +171,8 @@ def training(
 
     # load checkpoint
     if checkpoint_path:
-        checkpoint = torch.load(checkpoint_path)
+        with torch.serialization.safe_globals([np._core.multiarray.scalar]):
+            checkpoint = torch.load(checkpoint_path, map_location='cuda', weights_only=False)
         model_params = checkpoint["gaussians"]
         first_iter = checkpoint["iteration"]
         # cubemap_params = checkpoint["cubemap"]
