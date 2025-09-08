@@ -1,70 +1,63 @@
 # gsir_dearpygui_viewer.py
 #
-# Dear PyGui viewer (no Scene) that:
+# Dear PyGui viewer (PBR only):
 # 1) Loads a GSIR Gaussian checkpoint
-# 2) Builds a manual look-at camera (MiniCam schema: FoVx/FoVy/world_view/full_proj)
-# 3) Renders and displays
-# 4) Mouse orbit controls:
+# 2) Manual look-at camera (MiniCam schema matches your renderer)
+# 3) PBR relighting with an HDRI cubemap (no 3DGS shaded fallback)
+# 4) Mouse orbit:
 #    - LMB drag: orbit (yaw/pitch)
-#    - RMB drag: pan (move target in view plane)
-#    - Wheel: zoom (dolly radius)
+#    - RMB drag: pan
+#    - Wheel:    zoom
 #
 # Example:
 # python gsir_dearpygui_viewer.py \
 #   --checkpoint output/garden-linear/chkpnt35000.pth \
-#   --width 800 --height 600 \
-#   --fov_deg 60 \
-#   --eye 0 0 3 --center 0 0 0 --up 0 1 0
+#   --hdri assets/studio_small_08_4k.hdr \
+#   --width 800 --height 600 --fov_deg 60 \
+#   --eye 0 0 3 --center 0 0 0 --up 0 1 0 \
+#   --tone --gamma --metallic
 
 import os
 import sys
 import math
 from argparse import ArgumentParser
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple, Union, List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import dearpygui.dearpygui as dpg
+import nvdiffrast.torch as dr
 
-# ------ your codebase imports ------
+# --- project imports ---
 from arguments import PipelineParams
 from gaussian_renderer import GaussianModel, render
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
+from pbr import CubemapLight, get_brdf_lut, pbr_shading
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 
-# ----------------------------- Camera helpers -----------------------------
+# ---------------- Camera helpers ----------------
 
 def normalize_t(v: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
     return v / (torch.linalg.norm(v) + eps)
 
-
 def lookat_to_RT(eye: torch.Tensor, center: torch.Tensor, up: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build COLMAP-style world->camera [R|T].
-    x_cam = R x_world + T,   T = -R * C,   C = eye (camera center in world).
-    """
-    z = normalize_t(eye - center)              # forward (from center to eye)
-    x = normalize_t(torch.cross(up, z))        # right
-    y = torch.cross(z, x)                      # true up
-
-    R = torch.stack([x, y, z], dim=0)          # rows
+    z = normalize_t(eye - center)          # forward
+    x = normalize_t(torch.cross(up, z))    # right
+    y = torch.cross(z, x)                  # up
+    R = torch.stack([x, y, z], dim=0)
     T = -R @ eye
-
-    return (
-        R.detach().cpu().numpy().astype(np.float32),
-        T.detach().cpu().numpy().astype(np.float32),
-    )
-
+    return R.detach().cpu().numpy().astype(np.float32), T.detach().cpu().numpy().astype(np.float32)
 
 def fovx_from_fovy(fovy_rad: float, aspect: float) -> float:
-    # tan(fovx/2) = aspect * tan(fovy/2)
     return 2.0 * math.atan(aspect * math.tan(0.5 * fovy_rad))
 
-
 class MiniCam:
-    """
-    Matches your MiniCam fields (FoVx/FoVy, znear/zfar, world_view_transform, full_proj_transform, image_*).
-    """
     def __init__(
         self,
         width: int,
@@ -83,16 +76,13 @@ class MiniCam:
         self.FoVx = fovx
         self.znear = znear
         self.zfar = zfar
-
         self.world_view_transform = world_view_transform
         self.projection_matrix = projection_matrix
         self.full_proj_transform = self.world_view_transform.unsqueeze(0).bmm(
             self.projection_matrix.unsqueeze(0)
         ).squeeze(0)
-
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3].to(device)
-
 
 def build_minicam(
     width: int, height: int, fov_deg: float,
@@ -100,301 +90,582 @@ def build_minicam(
     device: torch.device,
     znear: float = 0.01, zfar: float = 100.0
 ) -> MiniCam:
-    """
-    Builds a MiniCam using your utils: getWorld2View2 and getProjectionMatrix.
-    Mirrors your Camera layout:
-      world_view_transform = getWorld2View2(...).T
-      projection_matrix   = getProjectionMatrix(...).T
-    """
     R_np, T_np = lookat_to_RT(eye, center, up)
     trans = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     scale = 1.0
-
     fovy = math.radians(fov_deg)
     aspect = float(width) / float(height)
     fovx = fovx_from_fovy(fovy, aspect)
-
     w2v = torch.tensor(getWorld2View2(R_np, T_np, trans, scale), dtype=torch.float32, device=device).transpose(0, 1)
     proj = torch.tensor(getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy),
                         dtype=torch.float32, device=device).transpose(0, 1)
-
     return MiniCam(width, height, fovy, fovx, znear, zfar, w2v, proj, device)
 
 
-# ----------------------------- Image utils -----------------------------
+# ---------------- Image helpers ----------------
 
 def tensor_to_rgba_list(img: Union[torch.Tensor, np.ndarray]) -> Tuple[int, int, list]:
-    """
-    Convert a [3,H,W] float tensor in [0,1] (or np array [H,W,3]) to an RGBA float list for DearPyGui.
-    Returns: (width, height, flat_list_rgba)
-    """
     if isinstance(img, torch.Tensor):
         img = img.detach().clamp(0, 1).permute(1, 2, 0).contiguous().cpu().numpy()
     else:
         img = np.clip(img, 0.0, 1.0)
-
     h, w, _ = img.shape
     alpha = np.ones((h, w, 1), dtype=img.dtype)
-    rgba = np.concatenate([img, alpha], axis=-1)  # [H,W,4] in [0,1]
+    rgba = np.concatenate([img, alpha], axis=-1)
     return w, h, rgba.reshape(-1).tolist()
 
-
-def make_bg_for_renderer(H: int, W: int, bg_color_val: float, device: torch.device) -> torch.Tensor:
-    # try [3], fall back to [3,H,W] in render_view
-    return torch.tensor([bg_color_val, bg_color_val, bg_color_val],
-                        dtype=torch.float32, device=device)
+def make_bg_for_renderer(bg_color_val: float, device: torch.device) -> torch.Tensor:
+    return torch.tensor([bg_color_val, bg_color_val, bg_color_val], dtype=torch.float32, device=device)
 
 
-# ---------------------------- Loader & Render -----------------------------
+# ---------------- PBR helpers (copied in) ----------------
+
+def cube_to_dir(s: int, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    if   s == 0: rx, ry, rz = torch.ones_like(x), -y, -x
+    elif s == 1: rx, ry, rz = -torch.ones_like(x), -y, x
+    elif s == 2: rx, ry, rz = x, torch.ones_like(x), y
+    elif s == 3: rx, ry, rz = x, -torch.ones_like(x), -y
+    elif s == 4: rx, ry, rz = x, -y, torch.ones_like(x)
+    elif s == 5: rx, ry, rz = -x, -y, -torch.ones_like(x)
+    return torch.stack((rx, ry, rz), dim=-1)
+
+def latlong_to_cubemap(latlong_map: torch.Tensor, res: List[int]) -> torch.Tensor:
+    cubemap = torch.zeros(6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device=latlong_map.device)
+    for s in range(6):
+        gy, gx = torch.meshgrid(
+            torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device=latlong_map.device),
+            torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device=latlong_map.device),
+            indexing="ij",
+        )
+        v = F.normalize(cube_to_dir(s, gx, gy), p=2, dim=-1)
+        tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
+        tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
+        texcoord = torch.cat((tu, tv), dim=-1)
+        cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
+    return cubemap
+
+def get_canonical_rays(H: int, W: int, tan_fovx: float, tan_fovy: float, device: torch.device) -> torch.Tensor:
+    """
+    Returns camera-space directions (not normalized) with z-forward convention.
+    `tan_fov*` should be tan(FOV*/2).
+    """
+    cen_x = W / 2.0
+    cen_y = H / 2.0
+    fx = W / (2.0 * tan_fovx)
+    fy = H / (2.0 * tan_fovy)
+    x, y = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing="xy")
+    x = x.flatten()
+    y = y.flatten()
+    camera_dirs = F.pad(
+        torch.stack([(x - cen_x + 0.5) / fx, (y - cen_y + 0.5) / fy], dim=-1),
+        (0, 1),
+        value=1.0,
+    )  # [H*W,3]
+    return camera_dirs
+
+
+# ---------------- Loader & PBR render ----------------
 
 @torch.no_grad()
 def load_gaussians_from_ckpt(checkpoint_path: str, sh_degree: int, device: torch.device) -> GaussianModel:
     gaussians = GaussianModel(sh_degree)
-    ckpt = torch.load(
-        checkpoint_path,
-        map_location=("cuda" if torch.cuda.is_available() else "cpu"),
-    )
+    ckpt = torch.load(checkpoint_path, map_location=("cuda" if torch.cuda.is_available() else "cpu"))
     if isinstance(ckpt, tuple):
         model_params = ckpt[0]
     elif isinstance(ckpt, dict):
         model_params = ckpt.get("gaussians", ckpt.get("state_dict", ckpt))
     else:
         raise TypeError("Unsupported checkpoint format for GSIR checkpoint.")
-
     gaussians.restore(model_params)
     return gaussians
 
-
 @torch.no_grad()
-def render_view(
+def render_view_pbr(
     cam: MiniCam,
     gaussians: GaussianModel,
     pipeline,
-    bg_color_val: float = 0.0,
+    bg_color_val: float,
+    hdri_path: str,
+    tone: bool,
+    gamma: bool,
+    metallic: bool,
 ) -> torch.Tensor:
+    if cv2 is None:
+        raise ImportError("OpenCV (cv2) is required to read HDR/EXR env maps. Please install opencv-python-headless.")
+    if not (isinstance(hdri_path, str) and os.path.isfile(hdri_path)):
+        raise FileNotFoundError(f"HDRI file not found: {hdri_path}")
+
     device = cam.world_view_transform.device
     H, W = cam.image_height, cam.image_width
-    bg_vec = make_bg_for_renderer(H, W, bg_color_val, device)
 
-    try:
-        out: Dict[str, torch.Tensor] = render(
-            viewpoint_camera=cam,
-            pc=gaussians,
-            pipe=pipeline,
-            bg_color=bg_vec,      # [3]
-            inference=True,
-            derive_normal=False,
-        )
-    except Exception:
-        bg_img = torch.full((3, H, W), fill_value=bg_color_val,
-                            dtype=torch.float32, device=device)
-        out: Dict[str, torch.Tensor] = render(
-            viewpoint_camera=cam,
-            pc=gaussians,
-            pipe=pipeline,
-            bg_color=bg_img,      # [3,H,W]
-            inference=True,
-            derive_normal=False,
-        )
+    # 1) GS rasterizer with normals/albedo/roughness/metallic
+    bg_vec = make_bg_for_renderer(bg_color_val, device)
+    result: Dict[str, torch.Tensor] = render(
+        viewpoint_camera=cam,
+        pc=gaussians,
+        pipe=pipeline,
+        bg_color=bg_vec,
+        inference=True,
+        pad_normal=True,
+        derive_normal=True,
+    )
 
-    return out["render"]  # [3,H,W] in [0,1]
+    normal_map    = result["normal_map"]      # [3,H,W]
+    normal_mask   = result["normal_mask"]     # [1,H,W]
+    albedo_map    = result["albedo_map"]      # [3,H,W]
+    roughness_map = result["roughness_map"]   # [1,H,W]
+    metallic_map  = result["metallic_map"]    # [1,H,W]
+
+    # 2) Build env cubemap from latlong HDR/EXR
+    bgr = cv2.imread(hdri_path, cv2.IMREAD_UNCHANGED)
+    if bgr is None:
+        raise RuntimeError(f"Failed to read HDRI: {hdri_path}")
+    hdri = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    hdri = torch.from_numpy(hdri).to(device=device, dtype=torch.float32)
+
+    res = 256
+    cubemap = CubemapLight(base_res=res).to(device)
+    cubemap.base.data = latlong_to_cubemap(hdri, [res, res])
+    cubemap.eval()
+    cubemap.build_mips()
+    brdf_lut = get_brdf_lut().to(device)
+
+    # 3) Per-pixel view directions (world space)
+    tan_fovx = math.tan(cam.FoVx * 0.5)
+    tan_fovy = math.tan(cam.FoVy * 0.5)
+    rays_cam = get_canonical_rays(H=H, W=W, tan_fovx=tan_fovx, tan_fovy=tan_fovy, device=device)  # [H*W,3]
+    rays_cam = F.normalize(rays_cam, p=2, dim=-1)
+    c2w = torch.inverse(cam.world_view_transform.T)  # [4,4]
+    view_dirs = -((rays_cam[:, None, :] * c2w[None, :3, :3]).sum(dim=-1)).reshape(H, W, 3)  # [H,W,3]
+
+    # 4) PBR shading
+    pbr = pbr_shading(
+        light=cubemap,
+        normals=normal_map.permute(1, 2, 0),                  # [H,W,3]
+        view_dirs=view_dirs,                                   # [H,W,3]
+        mask=normal_mask.permute(1, 2, 0),                     # [H,W,1]
+        albedo=albedo_map.permute(1, 2, 0),                    # [H,W,3]
+        roughness=roughness_map.permute(1, 2, 0),              # [H,W,1]
+        metallic=metallic_map.permute(1, 2, 0) if metallic else None,  # [H,W,1] or None
+        tone=tone,
+        gamma=gamma,
+        brdf_lut=brdf_lut,
+    )
+    rgb = pbr["render_rgb"].clamp(0.0, 1.0).permute(2, 0, 1)  # [3,H,W]
+    return rgb
 
 
-# ----------------------------- GUI App ------------------------------
+# ---------------- App ----------------
 
 class GSIRViewerApp:
-    def __init__(self, cam: MiniCam, gaussians: GaussianModel, pipeline, bg: float = 0.0):
+    def __init__(self, cam: MiniCam, gaussians: GaussianModel, pipeline,
+                 bg: float, hdri_path: str, tone: bool, gamma: bool, metallic: bool):
+        self.cam = cam
+        self.gaussians = gaussians
+        self.pipeline = pipeline# gsir_pbr_viewer.py
+#
+# Self-contained PBR + Viewer (no relight.py import, no fallbacks).
+# - PBR: Cook–Torrance GGX with directional light (no depth/points required).
+# - Uses GS rasterizer to fetch: albedo, normal, roughness, metallic.
+# - Orbit camera: LMB orbit, RMB pan, wheel zoom.
+#
+# Requirements in your env:
+#   - dearpygui
+#   - torch, numpy
+#   - your project modules: arguments, gaussian_renderer, utils.graphics_utils
+
+import os
+import sys
+import math
+from argparse import ArgumentParser
+from typing import Dict, Tuple, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import dearpygui.dearpygui as dpg
+
+# ---- project imports (unchanged) ----
+from arguments import PipelineParams
+from gaussian_renderer import GaussianModel, render
+from utils.graphics_utils import getProjectionMatrix, getWorld2View2
+
+
+# ===========================
+# Camera + tiny math helpers
+# ===========================
+
+def _normalize_t(v: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    return v / (torch.linalg.norm(v) + eps)
+
+def _lookat_to_RT(eye: torch.Tensor, center: torch.Tensor, up: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    z = _normalize_t(eye - center)               # forward
+    x = _normalize_t(torch.cross(up, z))         # right
+    y = torch.cross(z, x)                        # up
+    R = torch.stack([x, y, z], dim=0)
+    T = -R @ eye
+    return (
+        R.detach().cpu().numpy().astype(np.float32),
+        T.detach().cpu().numpy().astype(np.float32),
+    )
+
+def _fovx_from_fovy(fovy_rad: float, aspect: float) -> float:
+    return 2.0 * math.atan(aspect * math.tan(0.5 * fovy_rad))
+
+class MiniCam:
+    """Minimal camera matching your renderer expectations."""
+    def __init__(
+        self,
+        width: int, height: int,
+        fovy: float, fovx: float,
+        znear: float, zfar: float,
+        world_view_transform: torch.Tensor,
+        projection_matrix: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        self.image_width = width
+        self.image_height = height
+        self.FoVy = fovy
+        self.FoVx = fovx
+        self.znear = znear
+        self.zfar = zfar
+        self.world_view_transform = world_view_transform
+        self.projection_matrix = projection_matrix
+        self.full_proj_transform = self.world_view_transform.unsqueeze(0).bmm(
+            self.projection_matrix.unsqueeze(0)
+        ).squeeze(0)
+        view_inv = torch.inverse(self.world_view_transform)
+        self.camera_center = view_inv[3][:3].to(device)
+
+def build_minicam(
+    width: int, height: int, fov_deg: float,
+    eye: torch.Tensor, center: torch.Tensor, up: torch.Tensor,
+    device: torch.device, znear: float = 0.01, zfar: float = 100.0
+) -> MiniCam:
+    R_np, T_np = _lookat_to_RT(eye, center, up)
+    trans = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    scale = 1.0
+    fovy = math.radians(fov_deg)
+    aspect = float(width) / float(height)
+    fovx = _fovx_from_fovy(fovy, aspect)
+    w2v = torch.tensor(getWorld2View2(R_np, T_np, trans, scale), dtype=torch.float32, device=device).transpose(0, 1)
+    proj = torch.tensor(getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy),
+                        dtype=torch.float32, device=device).transpose(0, 1)
+    return MiniCam(width, height, fovy, fovx, znear, zfar, w2v, proj, device)
+
+
+# ===========================
+# PBR (Cook–Torrance, GGX)
+# ===========================
+
+def _saturate_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return (a * b).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
+
+def _DistributionGGX(n: torch.Tensor, h: torch.Tensor, rough: torch.Tensor) -> torch.Tensor:
+    # n,h: [...,3], rough: [...,1]
+    a  = rough * rough
+    a2 = a * a
+    NoH  = _saturate_dot(n, h)
+    NoH2 = NoH * NoH
+    nom = a2
+    denom = (NoH2 * (a2 - 1.0) + 1.0)
+    denom = math.pi * denom * denom
+    return nom / (denom + 1e-7)
+
+def _GeometrySchlickGGX(NoV: torch.Tensor, rough: torch.Tensor) -> torch.Tensor:
+    r = rough + 1.0
+    k = (r * r) / 8.0
+    return NoV / (NoV * (1.0 - k) + k + 1e-7)
+
+def _GeometrySmith(n: torch.Tensor, v: torch.Tensor, l: torch.Tensor, rough: torch.Tensor) -> torch.Tensor:
+    NoV = _saturate_dot(n, v)
+    NoL = _saturate_dot(n, l)
+    return _GeometrySchlickGGX(NoV, rough) * _GeometrySchlickGGX(NoL, rough)
+
+def _fresnel_schlick(HoV: torch.Tensor, F0: torch.Tensor) -> torch.Tensor:
+    return F0 + (1.0 - F0) * torch.pow((1.0 - HoV).clamp(0.0, 1.0), 5.0)
+
+def _apply_tone_gamma(img: torch.Tensor, tone: bool, gamma: bool) -> torch.Tensor:
+    # img: [H,W,3] linear
+    out = img
+    if tone:
+        # simple ACES-ish curve
+        a = 2.51
+        b = 0.03
+        c = 2.43
+        d = 0.59
+        e = 0.14
+        out = (out * (a * out + b)) / (out * (c * out + d) + e + 1e-8)
+    if gamma:
+        out = out.clamp(0, 1) ** (1.0 / 2.2)
+    return out
+
+
+def pbr_directional(
+    normals: torch.Tensor,     # [H,W,3], unit
+    view_dirs: torch.Tensor,   # [H,W,3], unit (from surface to camera)
+    albedo: torch.Tensor,      # [H,W,3] in [0,1]
+    roughness: torch.Tensor,   # [H,W,1] in [0,1]
+    mask: torch.Tensor,        # [H,W,1] bool-ish
+    *, light_dir_world: torch.Tensor,   # [3], unit
+    light_intensity: float,             # scalar radiance multiplier
+    metallic_map: Union[torch.Tensor, None] = None,  # [H,W,1]
+    tone: bool = False,
+    gamma: bool = False,
+) -> torch.Tensor:
+    """
+    Simple Cook–Torrance (GGX) directional-light PBR.
+    Returns [H,W,3] in [0,1] (after tone/gamma if toggled).
+    """
+    H, W, _ = normals.shape
+    device = normals.device
+
+    l = light_dir_world.reshape(1, 1, 3).expand(H, W, 3)     # [H,W,3], already normalized
+    v = view_dirs                                            # [H,W,3]
+    n = F.normalize(normals, p=2, dim=-1)                    # [H,W,3]
+    h = F.normalize(l + v, p=2, dim=-1)                      # [H,W,3]
+
+    NoV = _saturate_dot(n, v)  # [H,W,1]
+    NoL = _saturate_dot(n, l)  # [H,W,1]
+    HoV = _saturate_dot(h, v)  # [H,W,1]
+
+    F0 = torch.ones_like(albedo) * 0.04                      # dielectric base
+    if metallic_map is not None:
+        F0 = (1.0 - metallic_map) * 0.04 + albedo * metallic_map  # artist-friendly
+
+    D  = _DistributionGGX(n, h, roughness)                   # [H,W,1] broadcast to 3
+    G  = _GeometrySmith(n, v, l, roughness)                  # [H,W,1]
+    fresnel  = _fresnel_schlick(HoV, F0)                           # [H,W,3]
+
+    spec = (D * G).expand_as(fresnel) * fresnel / (4.0 * (NoV * NoL + 1e-7))  # [H,W,3]
+
+    kd = (1.0 - fresnel)                                           # [H,W,3]
+    if metallic_map is not None:
+        kd = kd * (1.0 - metallic_map)
+
+    radiance = light_intensity                               # scalar radiance
+    color = (kd * albedo / math.pi + spec) * radiance * NoL  # [H,W,3]
+    color = torch.where(mask > 0.5, color, torch.zeros_like(color))
+
+    color = _apply_tone_gamma(color, tone=tone, gamma=gamma).clamp(0.0, 1.0)
+    return color
+
+
+# ===========================
+# Render path (PBR only)
+# ===========================
+
+@torch.no_grad()
+def render_pbr_view(
+    cam: MiniCam,
+    gaussians: GaussianModel,
+    pipeline,
+    *,
+    bg: float,
+    light_dir: Tuple[float, float, float],
+    light_intensity: float,
+    tone: bool,
+    gamma: bool,
+    use_metallic: bool,
+) -> torch.Tensor:
+    """
+    PBR render entry point (directional light). Returns [3,H,W].
+    """
+    device = cam.world_view_transform.device
+    H, W = cam.image_height, cam.image_width
+
+    bg_vec = torch.tensor([bg, bg, bg], dtype=torch.float32, device=device)
+
+    # Ask rasterizer for material buffers
+    out: Dict[str, torch.Tensor] = render(
+        viewpoint_camera=cam,
+        pc=gaussians,
+        pipe=pipeline,
+        bg_color=bg_vec,
+        inference=True,
+        pad_normal=True,
+        derive_normal=True,
+    )
+    # expected: 'render' (old shaded), 'normal_map','normal_mask','albedo_map','roughness_map','metallic_map'
+    nmap   = out["normal_map"].permute(1, 2, 0)      # [H,W,3]
+    nmask  = out["normal_mask"].permute(1, 2, 0)     # [H,W,1]
+    albedo = out["albedo_map"].permute(1, 2, 0)      # [H,W,3]
+    rough  = out["roughness_map"].permute(1, 2, 0)   # [H,W,1]
+    metal  = out["metallic_map"].permute(1, 2, 0) if use_metallic else None  # [H,W,1] or None
+
+    # View dirs (world): from surface toward camera.
+    # With only normals available, we approximate by using the camera forward per pixel.
+    # A good approximation for viewdirs is using -Z_cam rotated to world; for perspective,
+    # direction varies slightly across the image, but this simple version is robust.
+    cam_to_world = torch.inverse(cam.world_view_transform.T)[:3, :3]       # [3,3]
+    v_world = (-cam_to_world[:, 2]).reshape(1, 1, 3).expand(H, W, 3)       # [H,W,3]
+    v_world = F.normalize(v_world, p=2, dim=-1)
+
+    light_dir_world = torch.tensor(light_dir, dtype=torch.float32, device=device)
+    light_dir_world = F.normalize(light_dir_world, p=2, dim=-1)
+
+    rgb = pbr_directional(
+        normals=nmap, view_dirs=v_world,
+        albedo=albedo, roughness=rough, mask=nmask,
+        light_dir_world=light_dir_world,
+        light_intensity=float(light_intensity),
+        metallic_map=metal,
+        tone=bool(tone), gamma=bool(gamma),
+    )  # [H,W,3]
+    return rgb.permute(2, 0, 1)  # [3,H,W]
+
+
+# ===========================
+# Viewer (Dear PyGui)
+# ===========================
+
+def _tensor_to_rgba_list(img: Union[torch.Tensor, np.ndarray]) -> Tuple[int, int, list]:
+    if isinstance(img, torch.Tensor):
+        img = img.detach().clamp(0,1).permute(1,2,0).contiguous().cpu().numpy()
+    else:
+        img = np.clip(img, 0.0, 1.0)
+    h, w, _ = img.shape
+    a = np.ones((h, w, 1), dtype=img.dtype)
+    rgba = np.concatenate([img, a], axis=-1)
+    return w, h, rgba.reshape(-1).tolist()
+
+class App:
+    def __init__(
+        self,
+        cam: MiniCam,
+        gaussians: GaussianModel,
+        pipeline,
+        *,
+        bg: float,
+        light_dir: Tuple[float, float, float],
+        light_intensity: float,
+        tone: bool,
+        gamma: bool,
+        use_metallic: bool,
+    ):
         self.cam = cam
         self.gaussians = gaussians
         self.pipeline = pipeline
+        self.bg = float(bg)
+        self.light_dir = tuple(light_dir)
+        self.light_intensity = float(light_intensity)
+        self.tone = bool(tone)
+        self.gamma = bool(gamma)
+        self.use_metallic = bool(use_metallic)
+
+        self.device = self.cam.world_view_transform.device
         self.texture_id = None
         self.tex_width = 0
         self.tex_height = 0
-        self.bg = bg
 
-        # Orbit state
-        self.device = self.cam.world_view_transform.device
-        self.target = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
-
-        # derive yaw/pitch/radius from initial eye/target
+        # Orbit rig state from initial camera center/target
+        self.target = torch.mean(self.gaussians.get_xyz, dim=0)
         v = (self.cam.camera_center - self.target).detach().cpu().numpy()
         self.radius = float(np.linalg.norm(v) + 1e-9)
-        # yaw: angle around +Y; pitch: elevation from horizon
-        self.yaw = math.atan2(v[0], v[2])                   # [-pi, pi]
-        self.pitch = math.atan2(v[1], math.sqrt(v[0]**2 + v[2]**2))  # (-pi/2, pi/2)
+        self.yaw   = math.atan2(v[0], v[2])
+        self.pitch = math.atan2(v[1], math.sqrt(v[0]**2 + v[2]**2))
 
-        # interaction
-        self._last_mouse_pos = (0.0, 0.0)
         self._lmb_down = False
         self._rmb_down = False
+        self.rotate_sensitivity = 0.0005
+        self.pan_sensitivity = 0.00015
+        self.zoom_sensitivity = 0.01
 
-        # sensitivities
-        self.rotate_sensitivity = 0.0005     # radians per pixel
-        self.pan_sensitivity = 0.00015       # world units per pixel (scaled by radius)
-        self.zoom_sensitivity = 0.01         # wheel units -> radius scale
-
-    # ---------- camera rebuild ----------
-
-    def _spherical_to_eye(self) -> torch.Tensor:
-        cp = math.cos(self.pitch)
-        sp = math.sin(self.pitch)
-        cy = math.cos(self.yaw)
-        sy = math.sin(self.yaw)
-
-        # Forward (from target to eye) in world axes
+    # Camera rebuild
+    def _eye_from_orbit(self) -> torch.Tensor:
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
         dir_world = torch.tensor([sy * cp, sp, cy * cp], dtype=torch.float32, device=self.device)
-        eye = self.target + self.radius * dir_world
-        return eye
+        return self.target + self.radius * dir_world
 
     def _rebuild_camera(self):
-        eye = self._spherical_to_eye()
+        eye = self._eye_from_orbit()
         self.cam = build_minicam(
-            width=self.cam.image_width,
-            height=self.cam.image_height,
+            width=self.cam.image_width, height=self.cam.image_height,
             fov_deg=math.degrees(self.cam.FoVy),
-            eye=eye,
-            center=self.target,
+            eye=eye, center=self.target,
             up=torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.device),
-            device=self.device,
-            znear=self.cam.znear,
-            zfar=self.cam.zfar,
+            device=self.device, znear=self.cam.znear, zfar=self.cam.zfar,
         )
 
-    def _update_texture(self):
-        img = render_view(self.cam, self.gaussians, self.pipeline, self.bg)
-        _, _, rgba = tensor_to_rgba_list(img)
+    # Render & upload
+    def _render_and_upload(self):
+        img = render_pbr_view(
+            self.cam, self.gaussians, self.pipeline,
+            bg=self.bg,
+            light_dir=self.light_dir,
+            light_intensity=self.light_intensity,
+            tone=self.tone, gamma=self.gamma,
+            use_metallic=self.use_metallic,
+        )
+        _, _, rgba = _tensor_to_rgba_list(img)
         dpg.set_value(self.texture_id, rgba)
 
-    # ---------- mouse handlers ----------
+    # Mouse handlers
+    def _on_mouse_down(self, button, x, y):
+        if button == 0: self._lmb_down = True
+        elif button == 1: self._rmb_down = True
 
-    def on_mouse_down(self, button, x, y):
-        self._last_mouse_pos = (x, y)
-        if button == 0:   # LMB
-            self._lmb_down = True
-        elif button == 1: # RMB
-            self._rmb_down = True
+    def _on_mouse_up(self, button, x, y):
+        if button == 0: self._lmb_down = False
+        elif button == 1: self._rmb_down = False
 
-    def on_mouse_release(self, button, x, y):
-        if button == 0:
-            self._lmb_down = False
-        elif button == 1:
-            self._rmb_down = False
-
-    def on_mouse_drag(self, button, data, dy):
-        dx = data[1]
-        dy = data[2]
+    def _on_drag(self, button, data):
+        dx, dy = float(data[1]), float(data[2])
         if button == 0 and self._lmb_down:
-            print(f'dx: {dx}')
-            print(f'dy: {dy}')
-            # Orbit
             self.yaw   -= dx * self.rotate_sensitivity
             self.pitch -= dy * self.rotate_sensitivity
-            # clamp pitch to avoid flip
-            limit = math.radians(89.0)
-            self.pitch = max(-limit, min(limit, self.pitch))
+            self.pitch = max(-math.radians(89.0), min(math.radians(89.0), self.pitch))
             self._rebuild_camera()
-            self._update_texture()
+            self._render_and_upload()
         elif button == 1 and self._rmb_down:
-            # Pan (move target along camera right/up)
-            # camera basis from view matrix (rows are cam axes in world coords)
-            w2v = self.cam.world_view_transform  # 4x4
-            # world->view rows are [right; up; forward]; take first 3 comps; normalize not strictly needed
+            w2v = self.cam.world_view_transform
             right = w2v[0, :3]; up = w2v[1, :3]
-            pan_scale = self.radius * self.pan_sensitivity
-            self.target = (self.target
-                           - right * (dx * pan_scale)
-                           + up    * (dy * pan_scale))
+            pan = self.radius * self.pan_sensitivity
+            self.target = self.target - right * (dx * pan) + up * (dy * pan)
             self._rebuild_camera()
-            self._update_texture()
+            self._render_and_upload()
 
-    def on_mouse_wheel(self, delta):
-        # zoom: adjust radius multiplicatively
-        # positive delta -> scroll up -> zoom in
-        scale = math.exp(-self.zoom_sensitivity * float(delta))
-        self.radius = max(1e-3, self.radius * scale)
+    def _on_wheel(self, delta):
+        self.radius = max(1e-3, self.radius * math.exp(-self.zoom_sensitivity * float(delta)))
         self._rebuild_camera()
-        self._update_texture()
+        self._render_and_upload()
 
-    # ---------- DPG setup & callbacks ----------
-
-    def _initial_render(self):
-        img = render_view(self.cam, self.gaussians, self.pipeline, self.bg)
-        w, h, rgba = tensor_to_rgba_list(img)
-        self.tex_width, self.tex_height = w, h
-        return rgba
-
-    def _attach_input_handlers(self):
-        with dpg.handler_registry():
-            # Mouse down / up
-            dpg.add_mouse_click_handler(callback=lambda s, a, u: self.on_mouse_down(a, *dpg.get_mouse_pos()))
-            dpg.add_mouse_release_handler(callback=lambda s, a, u: self.on_mouse_release(a, *dpg.get_mouse_pos()))
-            # Drag (we need deltas)
-            dpg.add_mouse_drag_handler(button=0, callback=lambda s, a, u: self.on_mouse_drag(0, a, a))  # dx=dy=a (DPG passes total?)
-            dpg.add_mouse_drag_handler(button=1, callback=lambda s, a, u: self.on_mouse_drag(1, a, a))
-            # The above generic drag signature isn't ideal in all DPG versions; fallback below using pos delta polling per frame.
-            dpg.add_mouse_wheel_handler(callback=lambda s, a, u: self.on_mouse_wheel(a))
-
-        # Fallback per-frame polling for robust dx/dy (works across DPG versions)
-        def frame_update():
-            x, y = dpg.get_mouse_pos()
-            dx = x - self._last_mouse_pos[0]
-            dy = y - self._last_mouse_pos[1]
-            if (self._lmb_down or self._rmb_down) and (dx != 0 or dy != 0):
-                if self._lmb_down:
-                    self.on_mouse_drag(0, dx, dy)
-                elif self._rmb_down:
-                    self.on_mouse_drag(1, dx, dy)
-            self._last_mouse_pos = (x, y)
-
-        # Register the per-frame callback
-        dpg.set_frame_callback(1, lambda: frame_update())
-
+    # DPG setup/run
     def run(self):
         dpg.create_context()
-        def save_init():
-            dpg.save_init_file("dpg.ini")
 
-        dpg.configure_app(init_file="dpg.ini")  # default file is 'dpg.ini'
-        with dpg.window(label="about", tag="main window"):
-            dpg.add_button(label="Save Window pos", callback=lambda: save_init)
-        rgba = self._initial_render()
+        img = render_pbr_view(
+            self.cam, self.gaussians, self.pipeline,
+            bg=self.bg, light_dir=self.light_dir,
+            light_intensity=self.light_intensity,
+            tone=self.tone, gamma=self.gamma,
+            use_metallic=self.use_metallic,
+        )
+        w, h, rgba = _tensor_to_rgba_list(img)
+        self.tex_width, self.tex_height = w, h
 
         dpg.create_viewport(
-            title="GSIR Dear PyGui Viewer (Orbit Camera, No Scene)",
+            title="GSIR PBR Viewer (Directional Light)",
             width=max(800, self.tex_width + 200),
             height=max(600, self.tex_height + 200),
         )
-
         with dpg.texture_registry(show=False):
             self.texture_id = dpg.add_dynamic_texture(self.tex_width, self.tex_height, rgba)
-
-        with dpg.window(label="GSIR Viewer", width=-1, height=-1, tag="Viewport"):
+        with dpg.window(label="Viewport", width=-1, height=-1, tag="Viewport"):
             with dpg.child_window(width=-1, height=-50, border=False):
                 dpg.add_image(self.texture_id)
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Re-render", callback=lambda: self._update_texture())
+                dpg.add_button(label="Re-render", callback=lambda: self._render_and_upload())
+                dpg.add_text(f"tone={'on' if self.tone else 'off'} | gamma={'on' if self.gamma else 'off'} | metallic={'on' if self.use_metallic else 'off'}")
+                dpg.add_text(f"light_dir={tuple(round(x,3) for x in self.light_dir)}  intensity={self.light_intensity}")
 
-        with dpg.window(label="GSIR Controls", width=580, height=280):
-            dpg.add_text("Model Selection")
-            dpg.add_combo(
-                label="Choose GSIR Model",
-                items=["Model A", "Model B", "Model C"],
-                default_value="Model A",
-                callback=lambda s,a,u: print(f"Selected model: {a}")
-            )
-            dpg.add_separator()
-            dpg.add_text("Environment Map")
-            dpg.add_input_text(
-                label="Env Map Path",
-                hint="Path to HDR or EXR file",
-                callback=lambda s,a,u: print(f"Env map path: {a}")
-            )
-            dpg.add_button(
-                label="Load Environment Map",
-                callback=lambda: print("Load env map clicked")
-            )
-
-        self._attach_input_handlers()
+        with dpg.handler_registry():
+            dpg.add_mouse_click_handler(callback=lambda s, a, u: self._on_mouse_down(a, *dpg.get_mouse_pos()))
+            dpg.add_mouse_release_handler(callback=lambda s, a, u: self._on_mouse_up(a, *dpg.get_mouse_pos()))
+            dpg.add_mouse_drag_handler(button=0, callback=lambda s, a, u: self._on_drag(0, a))
+            dpg.add_mouse_drag_handler(button=1, callback=lambda s, a, u: self._on_drag(1, a))
+            dpg.add_mouse_wheel_handler(callback=lambda s, a, u: self._on_wheel(a))
 
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -403,29 +674,34 @@ class GSIRViewerApp:
         dpg.destroy_context()
 
 
-# ----------------------------- Main -----------------------------
+# ===========================
+# Main
+# ===========================
 
 def main():
-    parser = ArgumentParser(description="GSIR Dear PyGui Viewer (Manual Camera, Orbit, No Scene)")
-
-    # Keep pipeline-only args (renderer likely needs it)
+    parser = ArgumentParser(description="Self-contained GSIR PBR Viewer (Directional Light, No Fallback)")
     pipeline = PipelineParams(parser)
 
-    # Essentials
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to GSIR gaussian checkpoint")
-    parser.add_argument("--bg", type=float, default=0.0, help="Background gray value in [0,1]")
-    parser.add_argument("--sh", type=int, default=3, help="SH degree for GaussianModel (match training)")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to GSIR checkpoint")
+    parser.add_argument("--bg", type=float, default=0.0, help="Background gray [0,1]")
+    parser.add_argument("--sh", type=int, default=3, help="SH degree for GaussianModel")
 
-    # Camera + image settings
     parser.add_argument("--width", type=int, default=800)
     parser.add_argument("--height", type=int, default=600)
-    parser.add_argument("--fov_deg", type=float, default=60.0, help="Vertical FOV in degrees")
+    parser.add_argument("--fov_deg", type=float, default=60.0)
     parser.add_argument("--znear", type=float, default=0.01)
     parser.add_argument("--zfar", type=float, default=100.0)
 
     parser.add_argument("--eye", type=float, nargs=3, default=[0.0, 0.0, 3.0])
     parser.add_argument("--center", type=float, nargs=3, default=[0.0, 0.0, 0.0])
     parser.add_argument("--up", type=float, nargs=3, default=[0.0, 1.0, 0.0])
+
+    # PBR light + tone/gamma toggles
+    parser.add_argument("--light_dir", type=float, nargs=3, default=[0.3, 0.6, 0.7], help="Directional light (world) xyz")
+    parser.add_argument("--light_intensity", type=float, default=3.0, help="Directional light intensity (scalar)")
+    parser.add_argument("--tone", action="store_true", help="Enable tone mapping (ACES-ish)")
+    parser.add_argument("--gamma", action="store_true", help="Enable gamma 2.2")
+    parser.add_argument("--metallic", action="store_true", help="Use predicted metallic map")
 
     args = parser.parse_args()
 
@@ -435,28 +711,35 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load Gaussians
-    gaussians = load_gaussians_from_ckpt(args.checkpoint, sh_degree=args.sh, device=device)
+    # Load gaussians
+    gaussians = GaussianModel(args.sh)
+    ckpt = torch.load(args.checkpoint, map_location=("cuda" if torch.cuda.is_available() else "cpu"))
+    if isinstance(ckpt, tuple):
+        model_params = ckpt[0]
+    elif isinstance(ckpt, dict):
+        model_params = ckpt.get("gaussians", ckpt.get("state_dict", ckpt))
+    else:
+        raise TypeError("Unsupported checkpoint format for GSIR checkpoint.")
+    gaussians.restore(model_params)
 
-    # Build initial MiniCam
+    # Camera
     eye = torch.tensor(args.eye, dtype=torch.float32, device=device)
     center = torch.tensor(args.center, dtype=torch.float32, device=device)
     up = torch.tensor(args.up, dtype=torch.float32, device=device)
     cam = build_minicam(
-        width=args.width,
-        height=args.height,
-        fov_deg=args.fov_deg,
-        eye=eye,
-        center=center,
-        up=up,
-        device=device,
-        znear=args.znear,
-        zfar=args.zfar,
+        width=args.width, height=args.height, fov_deg=args.fov_deg,
+        eye=eye, center=center, up=up, device=device, znear=args.znear, zfar=args.zfar,
     )
 
-    app = GSIRViewerApp(cam=cam, gaussians=gaussians, pipeline=pipeline.extract(args), bg=args.bg)
+    app = App(
+        cam=cam, gaussians=gaussians, pipeline=pipeline.extract(args),
+        bg=args.bg,
+        light_dir=tuple(args.light_dir),
+        light_intensity=args.light_intensity,
+        tone=args.tone, gamma=args.gamma,
+        use_metallic=args.metallic,
+    )
     app.run()
-
 
 if __name__ == "__main__":
     main()
