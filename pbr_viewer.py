@@ -19,6 +19,7 @@
 #     --width 1280 --height 720 --tone --gamma
 
 import os
+import math
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple, Optional
 
@@ -33,9 +34,37 @@ import nvdiffrast.torch as dr
 from arguments import GroupParams, ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
 from pbr import CubemapLight, get_brdf_lut, pbr_shading
-from scene import Scene
+from scene import Scene, Camera
 from utils.general_utils import safe_state
 from utils.image_utils import viridis_cmap
+from viewer_camera import ViewerCamera
+
+# ---- simple tone/gamma helpers for env background ----
+def _aces_film(x: torch.Tensor) -> torch.Tensor:
+    a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
+    return torch.clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
+
+
+def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
+    x = torch.clamp(x, min=0.0)
+    a = 0.055
+    return torch.where(x <= 0.0031308, 12.92 * x, (1 + a) * torch.pow(x, 1 / 2.4) - a)
+
+
+def _sample_env_latlong(latlong_map: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
+    """Sample a latlong HDRI with per-pixel ray directions.
+    Args:
+        latlong_map: [H_env, W_env, 3] float tensor (CUDA)
+        dirs: [H, W, 3] normalized ray directions in world space
+    Returns:
+        [H, W, 3] sampled color (linear)
+    """
+    v = torch.nn.functional.normalize(dirs, p=2, dim=-1)
+    tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
+    tv = torch.acos(torch.clamp(v[..., 1:2], min=-1.0, max=1.0)) / np.pi
+    texcoord = torch.cat((tu, tv), dim=-1)
+    sampled = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
+    return sampled
 
 # -----------------------------
 # Utilities
@@ -98,6 +127,48 @@ def tensor_to_dpg_rgba(img: torch.Tensor) -> np.ndarray:
     return rgba.detach().cpu().numpy().astype(np.float32).ravel()
 
 
+import numpy as np
+import math
+
+def euler_to_matrix(yaw: float, pitch: float, roll: float, order="zyx") -> np.ndarray:
+    """
+    Build a rotation matrix from Euler angles.
+    yaw   = rotation around Y axis
+    pitch = rotation around X axis
+    roll  = rotation around Z axis
+    
+    order: apply in "zyx" means R = Rz(roll) * Ry(yaw) * Rx(pitch)
+    """
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cr, sr = math.cos(roll), math.sin(roll)
+
+    R_yaw = np.array([
+        [ cy, 0, sy],
+        [  0, 1,  0],
+        [-sy, 0, cy],
+    ], dtype=np.float32)
+
+    R_pitch = np.array([
+        [1,  0,   0],
+        [0, cp, -sp],
+        [0, sp,  cp],
+    ], dtype=np.float32)
+
+    R_roll = np.array([
+        [cr, -sr, 0],
+        [sr,  cr, 0],
+        [ 0,   0, 1],
+    ], dtype=np.float32)
+
+    if order == "zyx":
+        return R_roll @ R_yaw @ R_pitch
+    elif order == "xyz":
+        return R_pitch @ R_yaw @ R_roll
+    else:
+        raise ValueError("Unsupported order")
+
+
 # -----------------------------
 # Viewer App
 # -----------------------------
@@ -109,10 +180,15 @@ class RelightViewer:
 
         # GS-IR scene & model
         self.gaussians = GaussianModel(args.sh_degree)
+
         self.scene = Scene(args, self.gaussians, shuffle=False)
 
         # Load checkpoint
         self._load_checkpoint(args.checkpoint)
+        # R = torch.from_numpy(euler_to_matrix(0.0, math.pi/2, math.pi/2, order="zyx")).cuda()
+        # print(R)
+        # print(self.gaussians.get_xyz.shape)
+        # self.gaussians._xyz = (R @ self.gaussians._xyz.T).T
 
         # Load HDRI -> Cubemap light
         if args.hdri is None:
@@ -130,17 +206,35 @@ class RelightViewer:
         # Precompute canonical rays for view-dir reconstruction
         self.canonical_rays = self.scene.get_canonical_rays()
 
-        # Cameras
         self.train_cams = self.scene.getTrainCameras()
         self.test_cams = self.scene.getTestCameras()
         self.split = "train" if len(self.train_cams) > 0 else "test"
         self.cam_index = 0
+
+        # Cameras
+        current_view = self.current_view()
+        self.camera = ViewerCamera(
+            FoVx=current_view.FoVx,
+            FoVy=current_view.FoVy,
+            W=current_view.image_width,
+            H=current_view.image_height,
+            data_device="cuda"
+        )
+        # self.camera.set_position(self.gaussians.get_xyz.mean(dim=0).detach().cpu().numpy())
+        self.target = self.gaussians.get_xyz.mean(dim=0).detach().cpu().numpy()
+        self.camera.look_at(self.target, distance=1.0)
+
+        self.orbit_radius = 3.0
+        self.orbit_azimuth = 0.0
+        self.orbit_elevation = 0.0
+
 
         # Render state
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
         self.enable_tone = bool(args.tone)
         self.enable_gamma = bool(args.gamma)
         self.enable_metallic = bool(args.metallic)
+        self.show_env_bg = not getattr(args, "no_env_bg", False)
 
         # DearPyGui state
         self.texture_id = None  # dynamic texture id
@@ -165,7 +259,8 @@ class RelightViewer:
     # -------------------------
     @torch.no_grad()
     def render_current(self) -> torch.Tensor:
-        view = self.current_view()
+        # view = self.current_view()
+        view = self.camera
 
         # GS-IR forward pass (request normals, albedo, roughness, metallic)
         self.background[...] = 0.0
@@ -211,8 +306,17 @@ class RelightViewer:
             brdf_lut=self.brdf_lut,
         )
         render_rgb = result["render_rgb"].clamp(0.0, 1.0)  # [H,W,3]
-        render_rgb = render_rgb.permute(2, 0, 1) * alpha_mask  # [3,H,W]
-        render_rgb = render_rgb.permute(1, 2, 0).contiguous()  # [H,W,3]
+        
+        # Composite the HDRI as a background where there's no geometry
+        if self.show_env_bg:
+            env_rgb = _sample_env_latlong(self.hdri, view_dirs)
+            if self.enable_tone:
+                env_rgb = _aces_film(env_rgb)
+            if self.enable_gamma:
+                env_rgb = _linear_to_srgb(env_rgb)
+            bg_mask = 1.0 - normal_mask.permute(1, 2, 0).clamp(0.0, 1.0)  # [H,W,1]
+            render_rgb = render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
+        
         return render_rgb
 
     def current_view(self):
@@ -302,6 +406,11 @@ class RelightViewer:
             dpg.add_checkbox(label="ACES tone mapping", default_value=self.enable_tone, callback=on_toggle_tone)
             dpg.add_checkbox(label="Gamma correction (sRGB)", default_value=self.enable_gamma, callback=on_toggle_gamma)
             dpg.add_checkbox(label="Use metallic map", default_value=self.enable_metallic, callback=on_toggle_metallic)
+            
+            def on_toggle_env(sender, app_data):
+                self.show_env_bg = bool(app_data)
+                render_callback()
+            dpg.add_checkbox(label="HDRI as background", default_value=self.show_env_bg, callback=on_toggle_env)
 
             dpg.add_separator()
             dpg.add_button(label="Render", callback=render_callback)
@@ -316,7 +425,55 @@ class RelightViewer:
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("Render", True)
-        dpg.start_dearpygui()
+        # dpg.start_dearpygui()
+        while dpg.is_dearpygui_running():
+            # ---- keyboard controls ----
+            if dpg.is_key_down(dpg.mvKey_W):
+                self.camera.move_forward(0.1)
+            if dpg.is_key_down(dpg.mvKey_S):
+                self.camera.move_forward(-0.1)
+            if dpg.is_key_down(dpg.mvKey_E):
+                self.camera.move_up(-0.1)
+            if dpg.is_key_down(dpg.mvKey_Q):
+                self.camera.move_up(0.1)
+            if dpg.is_key_down(dpg.mvKey_D):
+                self.camera.move_right(0.1)
+            if dpg.is_key_down(dpg.mvKey_A):
+                self.camera.move_right(-0.1)
+
+            # ---- keyboard orbit ----
+            if dpg.is_key_down(dpg.mvKey_Down):
+                self.camera.orbit(0.0, 0.1)
+            if dpg.is_key_down(dpg.mvKey_Up):
+                self.camera.orbit(0.0, -0.1)
+            if dpg.is_key_down(dpg.mvKey_Left):
+                self.camera.orbit(0.1, 0.0)
+            if dpg.is_key_down(dpg.mvKey_Right):
+                self.camera.orbit(-0.1, 0.0)
+
+            # ---- mouse orbit ----
+            # if dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
+            #     dx, dy = dpg.get_mouse_drag_delta()
+            #     sensitivity = 0.005  # radians per pixel
+            #     self.orbit_azimuth += dx * sensitivity
+            #     self.orbit_elevation += dy * sensitivity
+
+            #     # clamp elevation to avoid flipping
+            #     self.orbit_elevation = np.clip(self.orbit_elevation, -math.pi/2 + 0.01, math.pi/2 - 0.01)
+
+            #     # update camera
+            #     self.camera.look_at_orbit(
+            #         target=self.target,
+            #         radius=self.orbit_radius,
+            #         azimuth=self.orbit_azimuth,
+            #         elevation=self.orbit_elevation,
+            #     )
+
+
+            # ---- render ----
+            render_callback()
+            dpg.render_dearpygui_frame()
+
         dpg.destroy_context()
 
 
@@ -337,6 +494,7 @@ if __name__ == "__main__":
     parser.add_argument("--tone", action="store_true", help="Enable ACES filmic tone mapping.")
     parser.add_argument("--gamma", action="store_true", help="Enable linear->sRGB gamma correction.")
     parser.add_argument("--metallic", action="store_true", help="Use reconstructed metallic map.")
+    parser.add_argument("--no_env_bg", action="store_true", help="Disable compositing HDRI as background.")
 
     args = get_combined_args(parser)
 
