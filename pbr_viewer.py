@@ -1,23 +1,11 @@
 # viewer.py
 #
 # Dear PyGui viewer for GS-IR relighting with PBR shading.
-# - Loads a GSIR Gaussian checkpoint
-# - Loads an HDRI (latlong) and builds a cubemap light
-# - Renders a single selected camera view with PBR shading
-# - Displays the image in a DearPyGui window with simple controls
-# - NEW: Multiple hard-coded HDRI presets + UI switching with caching
 #
 # Requirements (available in your GS-IR repo):
 #   arguments.py, gaussian_renderer.py, pbr.py, scene.py, utils.*
 # Plus: dearpygui, nvdiffrast.torch, torchvision, torch, numpy, opencv
 #
-# Example:
-#   python viewer.py \
-#     -m output/garden-linear/ \
-#     -s dataset/nerf_data/nerf_real_360/garden/ \
-#     --checkpoint output/garden-linear/chkpnt35000.pth \
-#     --hdri assets/hdri/studio_small_09_2k.hdr \
-#     --width 1280 --height 720 --tone --gamma
 
 import os
 import math
@@ -25,24 +13,22 @@ from argparse import ArgumentParser
 from typing import Dict, List, Tuple, Optional
 import time
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision
 import dearpygui.dearpygui as dpg
-import nvdiffrast.torch as dr
 
 from arguments import GroupParams, ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
 from pbr import CubemapLight, get_brdf_lut, pbr_shading
-from scene import Scene, Camera
-from utils.general_utils import safe_state
-from utils.image_utils import viridis_cmap
+from scene import Scene
+from utils.graphics_utils import getProjectionMatrix
+from utils.general_utils import build_rotation, rotation_to_quaternion, safe_state
+from utils.viewer_utils import get_canonical_rays, tensor_to_raw_rgba, euler_to_matrix, _aces_film, _sample_env_latlong, latlong_to_cubemap, read_hdr, _linear_to_srgb
 from viewer_camera import ViewerCamera
 
 # -----------------------------
-# HDRI PRESETS (edit these paths/labels to your liking)
+# HDRI PRESETS 
 # -----------------------------
 HDRI_PRESETS: List[Tuple[str, str]] = [
     ("Bridge", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/bridge.hdr"),
@@ -61,220 +47,73 @@ HDRI_PRESETS: List[Tuple[str, str]] = [
     ("TZunnel", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/tunnel.hdr"),
 ]
 
-def tensor_to_raw_rgba(img: torch.Tensor) -> np.ndarray:
-    """
-    img: torch float tensor [H,W,3] in [0,1] (CUDA or CPU).
-    returns contiguous NumPy float32 [H,W,4] with alpha=1.
-    """
-    img = img.clamp(0.0, 1.0).detach().cpu().numpy().astype(np.float32)  # [H,W,3]
-    H, W, _ = img.shape
-    if img.flags['C_CONTIGUOUS'] is False:
-        img = np.ascontiguousarray(img)
-    alpha = np.ones((H, W, 1), dtype=np.float32)
-    rgba = np.concatenate([img, alpha], axis=-1)  # [H,W,4]
-    return np.ascontiguousarray(rgba)
-
-
-# ---- simple tone/gamma helpers for env background ----
-def _aces_film(x: torch.Tensor) -> torch.Tensor:
-    a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
-    return torch.clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
-
-
-def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
-    x = torch.clamp(x, min=0.0)
-    a = 0.055
-    return torch.where(x <= 0.0031308, 12.92 * x, (1 + a) * torch.pow(x, 1 / 2.4) - a)
-
-
-def _sample_env_latlong(latlong_map: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
-    """Sample a latlong HDRI with per-pixel ray directions.
-    Args:
-        latlong_map: [H_env, W_env, 3] float tensor (CUDA)
-        dirs: [H, W, 3] normalized ray directions in world space
-    Returns:
-        [H, W, 3] sampled color (linear)
-    """
-    v = torch.nn.functional.normalize(dirs, p=2, dim=-1)
-    tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
-    tv = torch.acos(torch.clamp(v[..., 1:2], min=-1.0, max=1.0)) / np.pi
-    texcoord = torch.cat((tu, tv), dim=-1)
-    sampled = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
-    return sampled
-
-# -----------------------------
-# Utilities
-# -----------------------------
-def read_hdr(path: str) -> np.ndarray:
-    """Read a latlong HDRI into float32 RGB numpy array."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"HDRI not found: {path}")
-    with open(path, "rb") as h:
-        buffer_ = np.frombuffer(h.read(), np.uint8)
-    bgr = cv2.imdecode(buffer_, cv2.IMREAD_UNCHANGED)
-    if bgr is None:
-        raise RuntimeError(f"Failed to decode HDRI: {path}")
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb.astype(np.float32)
-
-def cube_to_dir(s: int, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if s == 0:
-        rx, ry, rz = torch.ones_like(x), -y, -x
-    elif s == 1:
-        rx, ry, rz = -torch.ones_like(x), -y, x
-    elif s == 2:
-        rx, ry, rz = x, torch.ones_like(x), y
-    elif s == 3:
-        rx, ry, rz = x, -torch.ones_like(x), -y
-    elif s == 4:
-        rx, ry, rz = x, -y, torch.ones_like(x)
-    else:  # s == 5
-        rx, ry, rz = -x, -y, -torch.ones_like(x)
-    return torch.stack((rx, ry, rz), dim=-1)
-
-def latlong_to_cubemap(latlong_map: torch.Tensor, res_hw: List[int]) -> torch.Tensor:
-    """Convert latlong environment to a cubemap (6, H, W, C)."""
-    H, W = res_hw
-    C = latlong_map.shape[-1]
-    cubemap = torch.zeros(6, H, W, C, dtype=torch.float32, device=latlong_map.device)
-    for s in range(6):
-        gy, gx = torch.meshgrid(
-            torch.linspace(-1.0 + 1.0 / H, 1.0 - 1.0 / H, H, device=latlong_map.device),
-            torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device=latlong_map.device),
-            indexing="ij",
-        )
-        v = F.normalize(cube_to_dir(s, gx, gy), p=2, dim=-1)
-        tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
-        tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
-        texcoord = torch.cat((tu, tv), dim=-1)
-        cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
-    return cubemap
-
-def tensor_to_dpg_rgba(img: torch.Tensor) -> np.ndarray:
-    """Convert [H,W,3] float tensor in [0,1] to flattened RGBA float array for DearPyGui."""
-    img = img.clamp(0.0, 1.0)
-    H, W, _ = img.shape
-    alpha = torch.ones(H, W, 1, device=img.device, dtype=img.dtype)
-    rgba = torch.cat([img, alpha], dim=-1).contiguous()  # [H,W,4]
-    return rgba.detach().cpu().numpy().astype(np.float32).ravel()
-
-def euler_to_matrix(yaw: float, pitch: float, roll: float, order="zyx") -> np.ndarray:
-    """
-    Build a rotation matrix from Euler angles.
-    yaw   = rotation around Y axis
-    pitch = rotation around X axis
-    roll  = rotation around Z axis
-    """
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cr, sr = math.cos(roll), math.sin(roll)
-
-    R_yaw = np.array([
-        [ cy, 0, sy],
-        [  0, 1,  0],
-        [-sy, 0, cy],
-    ], dtype=np.float32)
-
-    R_pitch = np.array([
-        [1,  0,   0],
-        [0, cp, -sp],
-        [0, sp,  cp],
-    ], dtype=np.float32)
-
-    R_roll = np.array([
-        [cr, -sr, 0],
-        [sr,  cr, 0],
-        [ 0,   0, 1],
-    ], dtype=np.float32)
-
-    if order == "zyx":
-        return R_roll @ R_yaw @ R_pitch
-    elif order == "xyz":
-        return R_pitch @ R_yaw @ R_roll
-    else:
-        raise ValueError("Unsupported order")
-
-
 # -----------------------------
 # Viewer App
 # -----------------------------
 
 class RelightViewer:
     def __init__(self, args):
-        self._prof_acc = {"render":0, "env":0, "to_rgba":0, "tolist":0, "dpg_set":0}
-        self._prof_frames = 0
-        self._prof_print_every = 60  # print once per 60 frames
-        
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # GS-IR scene & model
         self.gaussians = GaussianModel(args.sh_degree)
         self.scene = Scene(args, self.gaussians, shuffle=False)
-
-        # Load checkpoint
         self._load_checkpoint(args.checkpoint)
 
-        # ---- HDRI presets & cache ----
-        # Build label->path dict from presets and ensure CLI --hdri is included
+        # Base Gaussian data (original state for rotation application)
+        self.xyz = self.gaussians.get_xyz.clone().detach()
+        self.rotation = self.gaussians.get_rotation.clone().detach()
+        
+        # Base Gaussian Rotation Fix (the original hardcoded R_fix)
+        self.base_R_fix = torch.from_numpy(euler_to_matrix(
+            torch.deg2rad(torch.tensor(0.0)), 
+            torch.deg2rad(torch.tensor(90.0)), 
+            torch.deg2rad(torch.tensor(0.0)))).cuda()
+
+        # HDRI presets & cache
         self.hdri_presets: List[Tuple[str, str]] = list(HDRI_PRESETS)
         if args.hdri is not None:
             if not any(os.path.normpath(p) == os.path.normpath(args.hdri) for _, p in self.hdri_presets):
                 self.hdri_presets.insert(0, ("(from --hdri)", args.hdri))
-
         self.hdri_labels = [lbl for (lbl, _) in self.hdri_presets]
         self.hdri_paths = {lbl: path for (lbl, path) in self.hdri_presets}
-        # Choose initial selection: match --hdri if possible, else first preset
         self.hdri_label_current = self._label_from_path(args.hdri) if args.hdri else self.hdri_labels[0]
+        self.hdri_cache_latlong: Dict[str, torch.Tensor] = {} 
+        self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {} 
 
-        self.hdri_cache_latlong: Dict[str, torch.Tensor] = {}  # label -> [H,W,3] float32 (device)
-        self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {}  # label -> [6,H,W,3] float32 (device)
-
-        # Create Cubemap light & BRDF LUT
-        res = args.env_res
-        self.light = CubemapLight(base_res=res).to(self.device)
+        # Light & BRDF
+        self.light = CubemapLight(base_res=args.env_res).to(self.device)
         self.brdf_lut = get_brdf_lut().to(self.device)
-
-        # Preload initial HDRI (latlong + cubemap)
         self._ensure_hdri(self.hdri_label_current)
         self.light.eval()
-        self.light.build_mips()
 
-        # Precompute canonical rays for view-dir reconstruction
-        self.canonical_rays = self.scene.get_canonical_rays()
-
-        self.train_cams = self.scene.getTrainCameras()
-        self.test_cams = self.scene.getTestCameras()
-        self.split = "train" if len(self.train_cams) > 0 else "test"
-        self.cam_index = 0
-
-        # Cameras
-        current_view = self.current_view()
+        # Camera setup
+        cams = self.scene.getTrainCameras() if self.scene.getTrainCameras() else self.scene.getTestCameras()
+        current_view = cams[0]
         self.camera = ViewerCamera(
-            FoVx=current_view.FoVx,
-            FoVy=current_view.FoVy,
-            W=current_view.image_width,
-            H=current_view.image_height,
-            data_device="cuda"
+            FoVx=current_view.FoVx, FoVy=current_view.FoVy, W=current_view.image_width, H=current_view.image_height, data_device="cuda"
         )
         self.target = self.gaussians.get_xyz.mean(dim=0).detach().cpu().numpy()
         self.camera.look_at(self.target, distance=1.0)
-
-        self.orbit_radius = 3.0
-        self.orbit_azimuth = 0.0
-        self.orbit_elevation = 0.0
-
-        # Render state
+        
+        # Render state & UI controls
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
-        self.enable_tone = bool(args.tone)
-        self.enable_gamma = bool(args.gamma)
-        self.enable_metallic = bool(args.metallic)
+        self.enable_tone = args.tone
+        self.enable_gamma = args.gamma
+        self.enable_metallic = args.metallic
         self.show_env_bg = not getattr(args, "no_env_bg", False)
+        
+        # NEW: Rotation states
+        self.gaussian_yaw_deg = 0.0 # Yaw for the Gaussian scene object
+        self.gaussian_pitch_deg = 0.0 # Yaw for the Gaussian scene object
+        self.gaussian_roll_deg = 0.0 # Yaw for the Gaussian scene object
+        self.hdri_rotation_deg = 0.0 # Yaw for the environment map
 
         # DearPyGui state
-        self.texture_id = None  # dynamic texture id
+        self.texture_id = None
         self.tex_size = (0, 0)
-        self.last_image_rgba: Optional[np.ndarray] = None
+        self.last_mouse_pos = None
 
     # ----- HDRI helpers -----
     def _label_from_path(self, path: str) -> str:
@@ -285,10 +124,8 @@ class RelightViewer:
         return self.hdri_labels[0]
 
     def _ensure_hdri(self, label: str):
-        """Load (and cache) latlong + cubemap for the given preset label, and bind to self.light."""
         path = self.hdri_paths[label]
         if label not in self.hdri_cache_latlong:
-            print(f"[viewer] Loading HDRI preset '{label}': {path}")
             hdri_np = read_hdr(path)
             self.hdri_cache_latlong[label] = torch.from_numpy(hdri_np).to(self.device)
         latlong = self.hdri_cache_latlong[label]
@@ -296,7 +133,6 @@ class RelightViewer:
         if label not in self.hdri_cache_cubemap:
             self.hdri_cache_cubemap[label] = latlong_to_cubemap(latlong, [self.args.env_res, self.args.env_res])
 
-        # Bind: set current hdri & cubemap to light
         self.hdri = self.hdri_cache_latlong[label]
         self.light.base.data = self.hdri_cache_cubemap[label]
         self.light.build_mips()
@@ -306,12 +142,7 @@ class RelightViewer:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         print(f"[viewer] Loading checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path)
-        if isinstance(checkpoint, Tuple):
-            model_params = checkpoint[0]
-        elif isinstance(checkpoint, Dict):
-            model_params = checkpoint.get("gaussians", checkpoint)
-        else:
-            raise TypeError("Unexpected checkpoint format.")
+        model_params = checkpoint.get("gaussians", checkpoint) if isinstance(checkpoint, Dict) else checkpoint[0]
         self.gaussians.restore(model_params)
 
     # -------------------------
@@ -319,264 +150,237 @@ class RelightViewer:
     # -------------------------
     @torch.no_grad()
     def render_current(self) -> torch.Tensor:
-        # ▶ start timing
-        t0 = time.perf_counter()
+        # --- Gaussian Scene Rotation ---
 
+        R_user = torch.from_numpy(euler_to_matrix(
+            torch.deg2rad(torch.tensor(self.gaussian_yaw_deg)), 
+            torch.deg2rad(torch.tensor(self.gaussian_pitch_deg)), 
+            torch.deg2rad(torch.tensor(self.gaussian_roll_deg)))).cuda()
+        
+        # 2. Combine with the original fixed rotation
+        R_combined = R_user @ self.base_R_fix[:3, :3]
+        
+        # 3. Apply the combined rotation to positions and rotations
+        self.gaussians._xyz = (R_combined @ self.xyz.T).T
+        self.gaussians._rotation = rotation_to_quaternion(R_combined @ build_rotation(self.rotation))
+        # -------------------------------
+        
         view = self.camera
 
-        # GS-IR forward pass (request normals, albedo, roughness, metallic)
-        self.background[...] = 0.0
-        t_render0 = time.perf_counter()
+        # GS-IR forward pass
         rendering_result = render(
-            viewpoint_camera=view,
-            pc=self.scene.gaussians,
-            pipe=self.args.pipeline,
-            bg_color=self.background,
-            inference=True,
-            pad_normal=True,
-            derive_normal=True,
+            viewpoint_camera=view, pc=self.scene.gaussians, pipe=self.args.pipeline, 
+            bg_color=self.background, inference=True, pad_normal=True, derive_normal=True,
         )
-        t_render1 = time.perf_counter()
 
+        normal_map = rendering_result["normal_map"]
+        opacity_mask = rendering_result["opacity_map"]
+        albedo_map = rendering_result["albedo_map"]
+        roughness_map = rendering_result["roughness_map"]
+        metallic_map = rendering_result["metallic_map"]
 
-        normal_map = rendering_result["normal_map"]  # [3,H,W]
-        normal_mask = rendering_result["normal_mask"]  # [1,H,W]
-        albedo_map = rendering_result["albedo_map"]  # [3,H,W]
-        roughness_map = rendering_result["roughness_map"]  # [1,H,W]
-        metallic_map = rendering_result["metallic_map"]  # [1,H,W]
-
-        # View directions per pixel (world space)
+        # World-space View directions
         H, W = view.image_height, view.image_width
-        c2w = torch.inverse(view.world_view_transform.T)  # [4,4]
+        c2w = torch.inverse(view.world_view_transform.T)
+        canonical_rays = get_canonical_rays(H, W, self.camera.FoVx, self.camera.FoVy)
         view_dirs = -(
-            (F.normalize(self.canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3])
-            .sum(dim=-1)
-            .reshape(H, W, 3)
+            (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3]).sum(dim=-1).reshape(H, W, 3)
         )  # [H,W,3]
 
-        # PBR shading
+        # --- HDRI Environment Rotation (Yaw) ---
+        env_yaw_rad = math.radians(self.hdri_rotation_deg)
+        env_cos_yaw = math.cos(env_yaw_rad)
+        env_sin_yaw = math.sin(env_yaw_rad)
+        
+        x, y, z = view_dirs[..., 0], view_dirs[..., 1], view_dirs[..., 2]
+        
+        # R_y(yaw) on view directions
+        x_rotated = x * env_cos_yaw - z * env_sin_yaw
+        z_rotated = x * env_sin_yaw + z * env_cos_yaw
+        light_sample_dirs = torch.stack([x_rotated, y, z_rotated], dim=-1) # [H,W,3]
+        # ---------------------------------------
+
+        # PBR shading (uses ROTATED direction vector for environment map sampling)
         result = pbr_shading(
             light=self.light,
-            normals=normal_map.permute(1, 2, 0),  # [H,W,3]
-            view_dirs=view_dirs,                   # [H,W,3]
-            mask=normal_mask.permute(1, 2, 0),     # [H,W,1]
-            albedo=albedo_map.permute(1, 2, 0),    # [H,W,3]
-            roughness=roughness_map.permute(1, 2, 0),  # [H,W,1]
-            metallic=metallic_map.permute(1, 2, 0) if self.enable_metallic else None,  # [H,W,1]
+            normals=normal_map.permute(1, 2, 0),
+            view_dirs=light_sample_dirs,         
+            mask=rendering_result["normal_mask"].permute(1, 2, 0),
+            albedo=albedo_map.permute(1, 2, 0),
+            roughness=roughness_map.permute(1, 2, 0),
+            metallic=metallic_map.permute(1, 2, 0) if self.enable_metallic else None,
             tone=self.enable_tone,
             gamma=self.enable_gamma,
             brdf_lut=self.brdf_lut,
         )
-        render_rgb = result["render_rgb"].clamp(0.0, 1.0)  # [H,W,3]
+        render_rgb = result["render_rgb"].clamp(0.0, 1.0)
 
-        t_env0 = time.perf_counter()
-        # Composite the HDRI as a background where there's no geometry
+        # Composite the HDRI as a background (uses ROTATED direction vector)
         if self.show_env_bg:
-            env_rgb = _sample_env_latlong(self.hdri, view_dirs)
+            env_rgb = _sample_env_latlong(self.hdri, light_sample_dirs) 
             if self.enable_tone:
                 env_rgb = _aces_film(env_rgb)
             if self.enable_gamma:
                 env_rgb = _linear_to_srgb(env_rgb)
-            bg_mask = 1.0 - normal_mask.permute(1, 2, 0).clamp(0.0, 1.0)  # [H,W,1]
+            bg_mask = 1.0 - opacity_mask.permute(1, 2, 0).clamp(0.0, 1.0)
             render_rgb = render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
-        t_env1 = time.perf_counter()
 
-        # ▶ end timing (sync to include GPU time), compute & print FPS
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
-        self._prof_acc["render"] += (t_render1 - t_render0)
-        self._prof_acc["env"]    += (t_env1 - t_env0)
-        self._prof_frames += 1
-
-
-        return render_rgb
-
-
-    def current_view(self):
-        cams = self.train_cams if self.split == "train" else self.test_cams
-        self.cam_index = max(0, min(self.cam_index, len(cams) - 1))
-        return cams[self.cam_index]
+        return render_rgb.clamp(0.0, 1.0)
 
     # -------------------------
     # DearPyGui UI
     # -------------------------
-    # (dynamic textures don't need a separate ensure step)
-
     def _update_image(self, img_rgb: torch.Tensor):
         H, W, _ = img_rgb.shape
-        t0 = time.perf_counter()
-        # rgba = tensor_to_dpg_rgba(img_rgb)
-        t1 = time.perf_counter()
-        # rgba_list = rgba.tolist()
-        t2 = time.perf_counter()
-
-        rgba_np = tensor_to_raw_rgba(img_rgb)  # img is your first render [H,W,3]
+        rgba_np = tensor_to_raw_rgba(img_rgb)
+        
         if self.texture_id is None or self.tex_size != (W, H):
-            # (Re)create dynamic texture and retarget the image widget
             try:
-                if self.texture_id is not None:
-                    dpg.delete_item(self.texture_id)
-            except Exception:
-                pass
+                if self.texture_id is not None: dpg.delete_item(self.texture_id)
+            except Exception: pass
             with dpg.texture_registry(show=False):
-                self.texture_id = dpg.add_raw_texture(
-                    W, H, rgba_np, format=dpg.mvFormat_Float_rgba
-                )
-
+                self.texture_id = dpg.add_raw_texture(W, H, rgba_np, format=dpg.mvFormat_Float_rgba)
             self.tex_size = (W, H)
-            # If image widget exists, retarget it; otherwise it will be created later
             if dpg.does_item_exist("render_image"):
                 dpg.configure_item("render_image", texture_tag=self.texture_id)
         else:
             dpg.set_value(self.texture_id, rgba_np)
-        self.last_image_rgba = rgba_np
-        t3 = time.perf_counter()
-        self._prof_acc["to_rgba"] += (t1 - t0)
-        self._prof_acc["tolist"]  += (t2 - t1)
-        self._prof_acc["dpg_set"] += (t3 - t2)
-
-        # print once in a while to avoid flooding
-        if self._prof_frames % self._prof_print_every == 0:
-            f = max(1, self._prof_frames)
-            def ms(key): return 1000.0 * self._prof_acc[key] / f
-            print(f"[prof avg / frame over {f} frames] "
-                f"render={ms('render'):.2f}ms  env={ms('env'):.2f}ms  "
-                f"to_rgba={ms('to_rgba'):.2f}ms  tolist={ms('tolist'):.2f}ms  dpg_set={ms('dpg_set'):.2f}ms")
-            # reset window
-            self._prof_acc = {k:0 for k in self._prof_acc}
-            self._prof_frames = 0
-
 
     def run(self):
         dpg.create_context()
-
-        # Pre-render once to bootstrap texture size and window sizing
         img = self.render_current()
         H, W, _ = img.shape
-        rgba = tensor_to_dpg_rgba(img).tolist()
-        self.tex_size = (W, H)
 
         dpg.create_viewport(title="GS-IR PBR Viewer", width=self.args.width, height=self.args.height)
 
         with dpg.texture_registry(show=False):
-            self.texture_id = dpg.add_dynamic_texture(W, H, rgba)
+            self.texture_id = dpg.add_raw_texture(W, H, tensor_to_raw_rgba(img), format=dpg.mvFormat_Float_rgba)
 
-        # UI callbacks
-        def render_callback():
+        # --- Helpers ---
+        def _rebuild_projection_for(camera, w: int, h: int):
+            if w <= 0 or h <= 0: return
+            aspect = float(w) / float(h)
+            tan_half_y = float(camera.FoVy)
+            tan_half_x = tan_half_y * aspect
+            camera.FoVx, camera.FoVy = tan_half_x, tan_half_y
+            camera.projection_matrix = (getProjectionMatrix(znear=camera.znear, zfar=camera.zfar, fovX=camera.FoVx, fovY=camera.FoVy).transpose(0, 1).to(camera.data_device))
+            camera.update_matrices()
+            camera.image = torch.zeros((3, h, w), dtype=torch.float32)
+
+        def render_callback(sender=None, app_data=None):
             try:
+                if torch.cuda.is_available(): torch.cuda.synchronize(self.device)
                 img2 = self.render_current()
                 self._update_image(img2)
             except Exception as e:
                 print(f"[viewer] Render error: {e}")
 
-        def on_split_change(sender, app_data):
-            self.split = app_data
-            self.cam_index = 0
+        def _apply_resize(new_w: int, new_h: int):
+            if new_w <= 0 or new_h <= 0: return
+            _rebuild_projection_for(self.camera, new_w, new_h)
+            if dpg.does_item_exist("render_image"):
+                dpg.configure_item("render_image", width=new_w - 20, height=new_h - 20)
             render_callback()
 
-        def on_cam_change(sender, app_data):
-            self.cam_index = int(app_data)
-            render_callback()
+        # --- UI Callbacks ---
+        def on_toggle_tone(sender, app_data): self.enable_tone = bool(app_data); render_callback()
+        def on_toggle_gamma(sender, app_data): self.enable_gamma = bool(app_data); render_callback()
+        def on_toggle_env(sender, app_data): self.show_env_bg = bool(app_data); render_callback()
+        def on_gaussian_rotation_yaw_change(sender, app_data): self.gaussian_yaw_deg = app_data; render_callback()
+        def on_gaussian_rotation_pitch_change(sender, app_data): self.gaussian_pitch_deg = app_data; render_callback()
+        def on_gaussian_rotation_roll_change(sender, app_data): self.gaussian_roll_deg = app_data; render_callback()
+        def on_hdri_rotation_change(sender, app_data): self.hdri_rotation_deg = app_data; render_callback()
 
-        def on_toggle_tone(sender, app_data):
-            self.enable_tone = bool(app_data)
-            render_callback()
-
-        def on_toggle_gamma(sender, app_data):
-            self.enable_gamma = bool(app_data)
-            render_callback()
-
-        def on_toggle_metallic(sender, app_data):
-            self.enable_metallic = bool(app_data)
-            render_callback()
-
-        def on_toggle_env(sender, app_data):
-            self.show_env_bg = bool(app_data)
-            render_callback()
-
-        # NEW: HDRI switching callback
         def on_hdri_change(sender, app_data):
-            # app_data is selected label
             self.hdri_label_current = app_data
             try:
                 self._ensure_hdri(self.hdri_label_current)
-                # update path text in UI
-                path = self.hdri_paths[self.hdri_label_current]
-                if dpg.does_item_exist("hdri_path_text"):
-                    dpg.set_value("hdri_path_text", f"HDRI:\n{path}")
             except Exception as e:
                 print(f"[viewer] HDRI switch error: {e}")
             render_callback()
 
+        # --- Windows ---
         with dpg.window(label="Controls", width=380, height=-1, pos=(10, 10)):
-            dpg.add_text("Dataset & Camera")
-            dpg.add_combo(items=["train", "test"], default_value=self.split, label="Split", callback=on_split_change)
-            train_n = len(self.train_cams)
-            test_n = len(self.test_cams)
-            dpg.add_text(f"Cameras: train={train_n}, test={test_n}")
-            dpg.add_input_int(label="Camera Index", default_value=0, min_value=0, step=1, callback=on_cam_change)
+            dpg.add_text("FPS: --", tag="fps_display")
+            dpg.add_text("Frame Time: -- ms", tag="frametime_display")
+            
+            dpg.add_separator()
+            dpg.add_text("Gaussian Controls")
+            dpg.add_slider_float(label="Gaussian Yaw", min_value=-180.0, max_value=180.0, default_value=self.gaussian_yaw_deg, format="%.1f deg", callback=on_gaussian_rotation_yaw_change)
+            dpg.add_slider_float(label="Gaussian Pitch", min_value=-180.0, max_value=180.0, default_value=self.gaussian_pitch_deg, format="%.1f deg", callback=on_gaussian_rotation_pitch_change)
+            dpg.add_slider_float(label="Gaussian Roll", min_value=-180.0, max_value=180.0, default_value=self.gaussian_roll_deg, format="%.1f deg", callback=on_gaussian_rotation_roll_change)
 
             dpg.add_separator()
             dpg.add_text("Shading")
             dpg.add_checkbox(label="ACES tone mapping", default_value=self.enable_tone, callback=on_toggle_tone)
             dpg.add_checkbox(label="Gamma correction (sRGB)", default_value=self.enable_gamma, callback=on_toggle_gamma)
-            dpg.add_checkbox(label="Use metallic map", default_value=self.enable_metallic, callback=on_toggle_metallic)
             dpg.add_checkbox(label="HDRI as background", default_value=self.show_env_bg, callback=on_toggle_env)
 
             dpg.add_separator()
             dpg.add_text("Environment")
-            dpg.add_combo(items=self.hdri_labels,
-                          default_value=self.hdri_label_current,
-                          label="HDRI Preset",
-                          callback=on_hdri_change)
-            dpg.add_text(f"HDRI:\n{self.hdri_paths[self.hdri_label_current]}", tag="hdri_path_text")
+            dpg.add_combo(items=self.hdri_labels, default_value=self.hdri_label_current, label="HDRI Preset", callback=on_hdri_change)
 
             dpg.add_separator()
-            dpg.add_button(label="Render", callback=render_callback)
+            dpg.add_button(label="Render Once", callback=render_callback)
 
             dpg.add_separator()
             dpg.add_text(f"Checkpoint:\n{self.args.checkpoint}")
 
-        with dpg.window(label="Render",  tag="Render", width=self.args.width - 410, height=self.args.height - 40, pos=(400, 10)):
-            dpg.add_image(texture_tag=self.texture_id, tag="render_image")
+        with dpg.window(label="Render", tag="Render", width=self.args.width - 410, height=self.args.height - 40, pos=(400, 10)):
+            dpg.add_image(texture_tag=self.texture_id, tag="render_image", width=W, height=H)
 
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("Render", True)
+        def _on_viewport_resize(sender, app_data, user_data): _apply_resize(dpg.get_viewport_client_width(), dpg.get_viewport_client_height())
+        dpg.set_viewport_resize_callback(callback=_on_viewport_resize)
+        _on_viewport_resize(None, None, None)
+
+        # --- Input loop ---
+        MOVE_SPEED, ORBIT_KEY_SPEED, MOUSE_SENSITIVITY, MAX_DT = 4.0, 4.0, 0.002, 0.10
+        _last_time = time.perf_counter()
 
         while dpg.is_dearpygui_running():
-            # ---- keyboard controls ----
-            if dpg.is_key_down(dpg.mvKey_W):
-                self.camera.move_forward(0.1)
-            if dpg.is_key_down(dpg.mvKey_S):
-                self.camera.move_forward(-0.1)
-            if dpg.is_key_down(dpg.mvKey_E):
-                self.camera.move_up(-0.1)
-            if dpg.is_key_down(dpg.mvKey_Q):
-                self.camera.move_up(0.1)
-            if dpg.is_key_down(dpg.mvKey_D):
-                self.camera.move_right(0.1)
-            if dpg.is_key_down(dpg.mvKey_A):
-                self.camera.move_right(-0.1)
+            now = time.perf_counter()
+            dt = min(now - _last_time, MAX_DT)
+            _last_time = now
+            
+            if dt > 0.0:
+                dpg.set_value("fps_display", f"FPS: {1.0 / dt:.1f}")
+                dpg.set_value("frametime_display", f"Frame Time: {dt * 1000.0:.2f} ms")
 
-            # ---- keyboard orbit ----
-            if dpg.is_key_down(dpg.mvKey_Down):
-                self.camera.orbit(0.0, 0.1)
-            if dpg.is_key_down(dpg.mvKey_Up):
-                self.camera.orbit(0.0, -0.1)
-            if dpg.is_key_down(dpg.mvKey_Left):
-                self.camera.orbit(0.1, 0.0)
-            if dpg.is_key_down(dpg.mvKey_Right):
-                self.camera.orbit(-0.1, 0.0)
+            # Camera movement
+            if dpg.is_key_down(dpg.mvKey_W): self.camera.move_forward(+MOVE_SPEED * dt)
+            if dpg.is_key_down(dpg.mvKey_S): self.camera.move_forward(-MOVE_SPEED * dt)
+            if dpg.is_key_down(dpg.mvKey_E): self.camera.move_up(-MOVE_SPEED * dt)
+            if dpg.is_key_down(dpg.mvKey_Q): self.camera.move_up(+MOVE_SPEED * dt)
+            if dpg.is_key_down(dpg.mvKey_D): self.camera.move_right(+MOVE_SPEED * dt)
+            if dpg.is_key_down(dpg.mvKey_A): self.camera.move_right(-MOVE_SPEED * dt)
 
-            # ---- render ----
+            # Camera orbit
+            yaw_delta, pitch_delta = 0.0, 0.0
+            if dpg.is_key_down(dpg.mvKey_Left):  yaw_delta  += +ORBIT_KEY_SPEED * dt
+            if dpg.is_key_down(dpg.mvKey_Right): yaw_delta  += -ORBIT_KEY_SPEED * dt
+            if dpg.is_key_down(dpg.mvKey_Up):    pitch_delta += -ORBIT_KEY_SPEED * dt
+            if dpg.is_key_down(dpg.mvKey_Down):  pitch_delta += +ORBIT_KEY_SPEED * dt
+            if yaw_delta or pitch_delta: self.camera.orbit(yaw_delta, pitch_delta)
+
+            if dpg.is_mouse_button_dragging(dpg.mvMouseButton_Left, threshold=0.0):
+                current_pos = dpg.get_mouse_pos(local=False)
+                if self.last_mouse_pos is None: self.last_mouse_pos = current_pos
+                dx = current_pos[0] - self.last_mouse_pos[0]
+                dy = current_pos[1] - self.last_mouse_pos[1]
+                self.last_mouse_pos = current_pos
+                self.camera.orbit(-dx * MOUSE_SENSITIVITY, +dy * MOUSE_SENSITIVITY)
+            else: self.last_mouse_pos = None
+
             render_callback()
             dpg.render_dearpygui_frame()
 
         dpg.destroy_context()
 
 # -----------------------------
-# CLI
+# CLI 
 # -----------------------------
 if __name__ == "__main__":
     parser = ArgumentParser(description="GS-IR PBR DearPyGui Viewer")
@@ -594,8 +398,8 @@ if __name__ == "__main__":
     parser.add_argument("--no_env_bg", action="store_true", help="Disable compositing HDRI as background.")
 
     args = get_combined_args(parser)
-
-    # Keep a copy of pipeline params inside args for convenient access in the viewer
+    
+    # Compatibility structure
     class _Args:
         pass
     _a = _Args()
@@ -603,10 +407,7 @@ if __name__ == "__main__":
     _a.pipeline = pipeline.extract(args)
     _a.sh_degree = args.sh_degree
 
-    model_path = os.path.dirname(args.checkpoint)
-    print("[viewer] Model path:", model_path)
-
     safe_state(getattr(args, "quiet", False))
-
+    
     app = RelightViewer(_a)
     app.run()

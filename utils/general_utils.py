@@ -110,6 +110,131 @@ def build_rotation(r: torch.Tensor) -> torch.Tensor:
     return R
 
 
+@torch.no_grad()
+def rotation_to_quaternion(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Convert rotation matrices to unit quaternions in [w, x, y, z] (scalar first).
+    R: (...,3,3) or (...,4,4)
+    Returns: (...,4) with [w, x, y, z]
+    """
+    if R.shape[-2:] == (4, 4):
+        R = R[..., :3, :3]
+
+    m00, m01, m02 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
+    m10, m11, m12 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
+    m20, m21, m22 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
+
+    t = m00 + m11 + m22
+
+    # Allocate
+    shp = R.shape[:-2]
+    w = torch.empty(shp, dtype=R.dtype, device=R.device)
+    x = torch.empty_like(w)
+    y = torch.empty_like(w)
+    z = torch.empty_like(w)
+
+    # Case 1: positive trace
+    c0 = t > 0
+    s0 = torch.sqrt(torch.clamp(t[c0] + 1.0, min=eps)) * 2.0  # s = 4*w
+    w[c0] = 0.25 * s0
+    x[c0] = (m21[c0] - m12[c0]) / s0
+    y[c0] = (m02[c0] - m20[c0]) / s0
+    z[c0] = (m10[c0] - m01[c0]) / s0
+
+    # Case 2: m00 is largest
+    c1 = (~c0) & (m00 >= m11) & (m00 >= m22)
+    s1 = torch.sqrt(torch.clamp(1.0 + m00[c1] - m11[c1] - m22[c1], min=eps)) * 2.0  # s = 4*x
+    w[c1] = (m21[c1] - m12[c1]) / s1
+    x[c1] = 0.25 * s1
+    y[c1] = (m01[c1] + m10[c1]) / s1
+    z[c1] = (m02[c1] + m20[c1]) / s1
+
+    # Case 3: m11 is largest
+    c2 = (~c0) & (~c1) & (m11 > m22)
+    s2 = torch.sqrt(torch.clamp(1.0 - m00[c2] + m11[c2] - m22[c2], min=eps)) * 2.0  # s = 4*y
+    w[c2] = (m02[c2] - m20[c2]) / s2
+    x[c2] = (m01[c2] + m10[c2]) / s2
+    y[c2] = 0.25 * s2
+    z[c2] = (m12[c2] + m21[c2]) / s2
+
+    # Case 4: m22 is largest
+    c3 = ~(c0 | c1 | c2)
+    s3 = torch.sqrt(torch.clamp(1.0 - m00[c3] - m11[c3] + m22[c3], min=eps)) * 2.0  # s = 4*z
+    w[c3] = (m10[c3] - m01[c3]) / s3
+    x[c3] = (m02[c3] + m20[c3]) / s3
+    y[c3] = (m12[c3] + m21[c3]) / s3
+    z[c3] = 0.25 * s3
+
+    q = torch.stack([w, x, y, z], dim=-1)
+    # Normalize to be safe
+    q = q / (q.norm(dim=-1, keepdim=True).clamp_min(eps))
+    return q
+
+
+def euler_to_matrix(euler: torch.Tensor,
+                    order: str = "ZYX",
+                    degrees: bool = False,
+                    intrinsic: bool = True) -> torch.Tensor:
+    """
+    Convert Euler angles to a rotation matrix.
+
+    Args:
+        euler: (..., 3) tensor of angles [a1, a2, a3].
+        order: Axis order string from {"XYZ","XZY","YXZ","YZX","ZXY","ZYX"} (case-insensitive).
+               Example: "ZYX" (yaw Z, pitch Y, roll X).
+        degrees: If True, interpret angles in degrees; otherwise radians.
+        intrinsic: If True, use intrinsic (rotating/body axes) composition:
+                   R = R(axis1,a1) @ R(axis2,a2) @ R(axis3,a3).
+                   If False, use extrinsic (fixed/world axes), which is the reverse order:
+                   R = R(axis3,a3) @ R(axis2,a2) @ R(axis1,a1).
+
+    Returns:
+        (..., 3, 3) rotation matrices with the same dtype/device as `euler`.
+    """
+    order = order.upper()
+    if len(order) != 3 or any(c not in "XYZ" for c in order) or len(set(order)) != 3:
+        raise ValueError("order must be a 3-letter Tait–Bryan sequence using X,Y,Z exactly once (e.g., 'ZYX').")
+
+    a1, a2, a3 = euler.unbind(dim=-1)
+    if degrees:
+        a1 = torch.deg2rad(a1)
+        a2 = torch.deg2rad(a2)
+        a3 = torch.deg2rad(a3)
+
+    def Rx(a):
+        ca, sa = torch.cos(a), torch.sin(a)
+        R = torch.zeros(a.shape + (3, 3), dtype=euler.dtype, device=euler.device)
+        R[..., 0, 0] = 1
+        R[..., 1, 1] = ca; R[..., 1, 2] = -sa
+        R[..., 2, 1] = sa; R[..., 2, 2] =  ca
+        return R
+
+    def Ry(a):
+        ca, sa = torch.cos(a), torch.sin(a)
+        R = torch.zeros(a.shape + (3, 3), dtype=euler.dtype, device=euler.device)
+        R[..., 1, 1] = 1
+        R[..., 0, 0] =  ca; R[..., 0, 2] =  sa
+        R[..., 2, 0] = -sa; R[..., 2, 2] =  ca
+        return R
+
+    def Rz(a):
+        ca, sa = torch.cos(a), torch.sin(a)
+        R = torch.zeros(a.shape + (3, 3), dtype=euler.dtype, device=euler.device)
+        R[..., 2, 2] = 1
+        R[..., 0, 0] =  ca; R[..., 0, 1] = -sa
+        R[..., 1, 0] =  sa; R[..., 1, 1] =  ca
+        return R
+
+    Ax = {"X": Rx, "Y": Ry, "Z": Rz}
+    R1 = Ax[order[0]](a1)
+    R2 = Ax[order[1]](a2)
+    R3 = Ax[order[2]](a3)
+
+    # Intrinsic (body): R = R1 @ R2 @ R3
+    # Extrinsic (world): apply in reverse order: R = R3 @ R2 @ R1
+    return R1 @ R2 @ R3 if intrinsic else R3 @ R2 @ R1
+
+
 def build_scaling_rotation(s: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
     L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
     R = build_rotation(r)
