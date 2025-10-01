@@ -5,6 +5,7 @@
 # - Loads an HDRI (latlong) and builds a cubemap light
 # - Renders a single selected camera view with PBR shading
 # - Displays the image in a DearPyGui window with simple controls
+# - NEW: Multiple hard-coded HDRI presets + UI switching with caching
 #
 # Requirements (available in your GS-IR repo):
 #   arguments.py, gaussian_renderer.py, pbr.py, scene.py, utils.*
@@ -22,6 +23,7 @@ import os
 import math
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple, Optional
+import time
 
 import cv2
 import numpy as np
@@ -38,6 +40,40 @@ from scene import Scene, Camera
 from utils.general_utils import safe_state
 from utils.image_utils import viridis_cmap
 from viewer_camera import ViewerCamera
+
+# -----------------------------
+# HDRI PRESETS (edit these paths/labels to your liking)
+# -----------------------------
+HDRI_PRESETS: List[Tuple[str, str]] = [
+    ("Bridge", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/bridge.hdr"),
+    ("City", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/city.hdr"),
+    ("Courtyard", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/courtyard.hdr"),
+    ("Fireplace", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/fireplace.hdr"),
+    ("Forest", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/forest.hdr"),
+    ("Interior", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/interior.hdr"),
+    ("Museum", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/museum.hdr"),
+    ("Night", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/night.hdr"),
+    ("Snow", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/snow.hdr"),
+    ("Square", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/square.hdr"),
+    ("Studio", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/studio.hdr"),
+    ("Sunrise", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/sunrise.hdr"),
+    ("Sunset", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/sunset.hdr"),
+    ("TZunnel", "/workspace/data/Datasets/TensoIR_Synthtic/Environment_Maps/high_res_envmaps_1k/tunnel.hdr"),
+]
+
+def tensor_to_raw_rgba(img: torch.Tensor) -> np.ndarray:
+    """
+    img: torch float tensor [H,W,3] in [0,1] (CUDA or CPU).
+    returns contiguous NumPy float32 [H,W,4] with alpha=1.
+    """
+    img = img.clamp(0.0, 1.0).detach().cpu().numpy().astype(np.float32)  # [H,W,3]
+    H, W, _ = img.shape
+    if img.flags['C_CONTIGUOUS'] is False:
+        img = np.ascontiguousarray(img)
+    alpha = np.ones((H, W, 1), dtype=np.float32)
+    rgba = np.concatenate([img, alpha], axis=-1)  # [H,W,4]
+    return np.ascontiguousarray(rgba)
+
 
 # ---- simple tone/gamma helpers for env background ----
 def _aces_film(x: torch.Tensor) -> torch.Tensor:
@@ -69,7 +105,6 @@ def _sample_env_latlong(latlong_map: torch.Tensor, dirs: torch.Tensor) -> torch.
 # -----------------------------
 # Utilities
 # -----------------------------
-
 def read_hdr(path: str) -> np.ndarray:
     """Read a latlong HDRI into float32 RGB numpy array."""
     if not os.path.isfile(path):
@@ -81,7 +116,6 @@ def read_hdr(path: str) -> np.ndarray:
         raise RuntimeError(f"Failed to decode HDRI: {path}")
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return rgb.astype(np.float32)
-
 
 def cube_to_dir(s: int, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     if s == 0:
@@ -97,7 +131,6 @@ def cube_to_dir(s: int, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     else:  # s == 5
         rx, ry, rz = -x, -y, -torch.ones_like(x)
     return torch.stack((rx, ry, rz), dim=-1)
-
 
 def latlong_to_cubemap(latlong_map: torch.Tensor, res_hw: List[int]) -> torch.Tensor:
     """Convert latlong environment to a cubemap (6, H, W, C)."""
@@ -117,7 +150,6 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res_hw: List[int]) -> torch.Te
         cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
     return cubemap
 
-
 def tensor_to_dpg_rgba(img: torch.Tensor) -> np.ndarray:
     """Convert [H,W,3] float tensor in [0,1] to flattened RGBA float array for DearPyGui."""
     img = img.clamp(0.0, 1.0)
@@ -126,18 +158,12 @@ def tensor_to_dpg_rgba(img: torch.Tensor) -> np.ndarray:
     rgba = torch.cat([img, alpha], dim=-1).contiguous()  # [H,W,4]
     return rgba.detach().cpu().numpy().astype(np.float32).ravel()
 
-
-import numpy as np
-import math
-
 def euler_to_matrix(yaw: float, pitch: float, roll: float, order="zyx") -> np.ndarray:
     """
     Build a rotation matrix from Euler angles.
     yaw   = rotation around Y axis
     pitch = rotation around X axis
     roll  = rotation around Z axis
-    
-    order: apply in "zyx" means R = Rz(roll) * Ry(yaw) * Rx(pitch)
     """
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
@@ -175,33 +201,44 @@ def euler_to_matrix(yaw: float, pitch: float, roll: float, order="zyx") -> np.nd
 
 class RelightViewer:
     def __init__(self, args):
+        self._prof_acc = {"render":0, "env":0, "to_rgba":0, "tolist":0, "dpg_set":0}
+        self._prof_frames = 0
+        self._prof_print_every = 60  # print once per 60 frames
+        
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # GS-IR scene & model
         self.gaussians = GaussianModel(args.sh_degree)
-
         self.scene = Scene(args, self.gaussians, shuffle=False)
 
         # Load checkpoint
         self._load_checkpoint(args.checkpoint)
-        # R = torch.from_numpy(euler_to_matrix(0.0, math.pi/2, math.pi/2, order="zyx")).cuda()
-        # print(R)
-        # print(self.gaussians.get_xyz.shape)
-        # self.gaussians._xyz = (R @ self.gaussians._xyz.T).T
 
-        # Load HDRI -> Cubemap light
-        if args.hdri is None:
-            raise ValueError("--hdri is required for PBR rendering.")
-        print(f"[viewer] Loading HDRI: {args.hdri}")
-        hdri_np = read_hdr(args.hdri)
-        self.hdri = torch.from_numpy(hdri_np).to(self.device)
+        # ---- HDRI presets & cache ----
+        # Build label->path dict from presets and ensure CLI --hdri is included
+        self.hdri_presets: List[Tuple[str, str]] = list(HDRI_PRESETS)
+        if args.hdri is not None:
+            if not any(os.path.normpath(p) == os.path.normpath(args.hdri) for _, p in self.hdri_presets):
+                self.hdri_presets.insert(0, ("(from --hdri)", args.hdri))
+
+        self.hdri_labels = [lbl for (lbl, _) in self.hdri_presets]
+        self.hdri_paths = {lbl: path for (lbl, path) in self.hdri_presets}
+        # Choose initial selection: match --hdri if possible, else first preset
+        self.hdri_label_current = self._label_from_path(args.hdri) if args.hdri else self.hdri_labels[0]
+
+        self.hdri_cache_latlong: Dict[str, torch.Tensor] = {}  # label -> [H,W,3] float32 (device)
+        self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {}  # label -> [6,H,W,3] float32 (device)
+
+        # Create Cubemap light & BRDF LUT
         res = args.env_res
         self.light = CubemapLight(base_res=res).to(self.device)
-        self.light.base.data = latlong_to_cubemap(self.hdri, [res, res])
+        self.brdf_lut = get_brdf_lut().to(self.device)
+
+        # Preload initial HDRI (latlong + cubemap)
+        self._ensure_hdri(self.hdri_label_current)
         self.light.eval()
         self.light.build_mips()
-        self.brdf_lut = get_brdf_lut().to(self.device)
 
         # Precompute canonical rays for view-dir reconstruction
         self.canonical_rays = self.scene.get_canonical_rays()
@@ -220,14 +257,12 @@ class RelightViewer:
             H=current_view.image_height,
             data_device="cuda"
         )
-        # self.camera.set_position(self.gaussians.get_xyz.mean(dim=0).detach().cpu().numpy())
         self.target = self.gaussians.get_xyz.mean(dim=0).detach().cpu().numpy()
         self.camera.look_at(self.target, distance=1.0)
 
         self.orbit_radius = 3.0
         self.orbit_azimuth = 0.0
         self.orbit_elevation = 0.0
-
 
         # Render state
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
@@ -240,6 +275,31 @@ class RelightViewer:
         self.texture_id = None  # dynamic texture id
         self.tex_size = (0, 0)
         self.last_image_rgba: Optional[np.ndarray] = None
+
+    # ----- HDRI helpers -----
+    def _label_from_path(self, path: str) -> str:
+        norm = os.path.normpath(path)
+        for lbl, p in self.hdri_presets:
+            if os.path.normpath(p) == norm:
+                return lbl
+        return self.hdri_labels[0]
+
+    def _ensure_hdri(self, label: str):
+        """Load (and cache) latlong + cubemap for the given preset label, and bind to self.light."""
+        path = self.hdri_paths[label]
+        if label not in self.hdri_cache_latlong:
+            print(f"[viewer] Loading HDRI preset '{label}': {path}")
+            hdri_np = read_hdr(path)
+            self.hdri_cache_latlong[label] = torch.from_numpy(hdri_np).to(self.device)
+        latlong = self.hdri_cache_latlong[label]
+
+        if label not in self.hdri_cache_cubemap:
+            self.hdri_cache_cubemap[label] = latlong_to_cubemap(latlong, [self.args.env_res, self.args.env_res])
+
+        # Bind: set current hdri & cubemap to light
+        self.hdri = self.hdri_cache_latlong[label]
+        self.light.base.data = self.hdri_cache_cubemap[label]
+        self.light.build_mips()
 
     def _load_checkpoint(self, ckpt_path: str):
         if not os.path.isfile(ckpt_path):
@@ -259,11 +319,14 @@ class RelightViewer:
     # -------------------------
     @torch.no_grad()
     def render_current(self) -> torch.Tensor:
-        # view = self.current_view()
+        # ▶ start timing
+        t0 = time.perf_counter()
+
         view = self.camera
 
         # GS-IR forward pass (request normals, albedo, roughness, metallic)
         self.background[...] = 0.0
+        t_render0 = time.perf_counter()
         rendering_result = render(
             viewpoint_camera=view,
             pc=self.scene.gaussians,
@@ -273,6 +336,8 @@ class RelightViewer:
             pad_normal=True,
             derive_normal=True,
         )
+        t_render1 = time.perf_counter()
+
 
         normal_map = rendering_result["normal_map"]  # [3,H,W]
         normal_mask = rendering_result["normal_mask"]  # [1,H,W]
@@ -289,16 +354,13 @@ class RelightViewer:
             .reshape(H, W, 3)
         )  # [H,W,3]
 
-        # Mask
-        alpha_mask = view.gt_alpha_mask.to(self.device)
-
         # PBR shading
         result = pbr_shading(
             light=self.light,
             normals=normal_map.permute(1, 2, 0),  # [H,W,3]
-            view_dirs=view_dirs,  # [H,W,3]
-            mask=normal_mask.permute(1, 2, 0),  # [H,W,1]
-            albedo=albedo_map.permute(1, 2, 0),  # [H,W,3]
+            view_dirs=view_dirs,                   # [H,W,3]
+            mask=normal_mask.permute(1, 2, 0),     # [H,W,1]
+            albedo=albedo_map.permute(1, 2, 0),    # [H,W,3]
             roughness=roughness_map.permute(1, 2, 0),  # [H,W,1]
             metallic=metallic_map.permute(1, 2, 0) if self.enable_metallic else None,  # [H,W,1]
             tone=self.enable_tone,
@@ -306,7 +368,8 @@ class RelightViewer:
             brdf_lut=self.brdf_lut,
         )
         render_rgb = result["render_rgb"].clamp(0.0, 1.0)  # [H,W,3]
-        
+
+        t_env0 = time.perf_counter()
         # Composite the HDRI as a background where there's no geometry
         if self.show_env_bg:
             env_rgb = _sample_env_latlong(self.hdri, view_dirs)
@@ -316,8 +379,18 @@ class RelightViewer:
                 env_rgb = _linear_to_srgb(env_rgb)
             bg_mask = 1.0 - normal_mask.permute(1, 2, 0).clamp(0.0, 1.0)  # [H,W,1]
             render_rgb = render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
-        
+        t_env1 = time.perf_counter()
+
+        # ▶ end timing (sync to include GPU time), compute & print FPS
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        self._prof_acc["render"] += (t_render1 - t_render0)
+        self._prof_acc["env"]    += (t_env1 - t_env0)
+        self._prof_frames += 1
+
+
         return render_rgb
+
 
     def current_view(self):
         cams = self.train_cams if self.split == "train" else self.test_cams
@@ -331,8 +404,13 @@ class RelightViewer:
 
     def _update_image(self, img_rgb: torch.Tensor):
         H, W, _ = img_rgb.shape
-        rgba = tensor_to_dpg_rgba(img_rgb)
-        rgba_list = rgba.tolist()
+        t0 = time.perf_counter()
+        # rgba = tensor_to_dpg_rgba(img_rgb)
+        t1 = time.perf_counter()
+        # rgba_list = rgba.tolist()
+        t2 = time.perf_counter()
+
+        rgba_np = tensor_to_raw_rgba(img_rgb)  # img is your first render [H,W,3]
         if self.texture_id is None or self.tex_size != (W, H):
             # (Re)create dynamic texture and retarget the image widget
             try:
@@ -341,14 +419,33 @@ class RelightViewer:
             except Exception:
                 pass
             with dpg.texture_registry(show=False):
-                self.texture_id = dpg.add_dynamic_texture(W, H, rgba_list)
+                self.texture_id = dpg.add_raw_texture(
+                    W, H, rgba_np, format=dpg.mvFormat_Float_rgba
+                )
+
             self.tex_size = (W, H)
             # If image widget exists, retarget it; otherwise it will be created later
             if dpg.does_item_exist("render_image"):
                 dpg.configure_item("render_image", texture_tag=self.texture_id)
         else:
-            dpg.set_value(self.texture_id, rgba_list)
-        self.last_image_rgba = np.array(rgba, dtype=np.float32)
+            dpg.set_value(self.texture_id, rgba_np)
+        self.last_image_rgba = rgba_np
+        t3 = time.perf_counter()
+        self._prof_acc["to_rgba"] += (t1 - t0)
+        self._prof_acc["tolist"]  += (t2 - t1)
+        self._prof_acc["dpg_set"] += (t3 - t2)
+
+        # print once in a while to avoid flooding
+        if self._prof_frames % self._prof_print_every == 0:
+            f = max(1, self._prof_frames)
+            def ms(key): return 1000.0 * self._prof_acc[key] / f
+            print(f"[prof avg / frame over {f} frames] "
+                f"render={ms('render'):.2f}ms  env={ms('env'):.2f}ms  "
+                f"to_rgba={ms('to_rgba'):.2f}ms  tolist={ms('tolist'):.2f}ms  dpg_set={ms('dpg_set'):.2f}ms")
+            # reset window
+            self._prof_acc = {k:0 for k in self._prof_acc}
+            self._prof_frames = 0
+
 
     def run(self):
         dpg.create_context()
@@ -393,6 +490,24 @@ class RelightViewer:
             self.enable_metallic = bool(app_data)
             render_callback()
 
+        def on_toggle_env(sender, app_data):
+            self.show_env_bg = bool(app_data)
+            render_callback()
+
+        # NEW: HDRI switching callback
+        def on_hdri_change(sender, app_data):
+            # app_data is selected label
+            self.hdri_label_current = app_data
+            try:
+                self._ensure_hdri(self.hdri_label_current)
+                # update path text in UI
+                path = self.hdri_paths[self.hdri_label_current]
+                if dpg.does_item_exist("hdri_path_text"):
+                    dpg.set_value("hdri_path_text", f"HDRI:\n{path}")
+            except Exception as e:
+                print(f"[viewer] HDRI switch error: {e}")
+            render_callback()
+
         with dpg.window(label="Controls", width=380, height=-1, pos=(10, 10)):
             dpg.add_text("Dataset & Camera")
             dpg.add_combo(items=["train", "test"], default_value=self.split, label="Split", callback=on_split_change)
@@ -406,18 +521,21 @@ class RelightViewer:
             dpg.add_checkbox(label="ACES tone mapping", default_value=self.enable_tone, callback=on_toggle_tone)
             dpg.add_checkbox(label="Gamma correction (sRGB)", default_value=self.enable_gamma, callback=on_toggle_gamma)
             dpg.add_checkbox(label="Use metallic map", default_value=self.enable_metallic, callback=on_toggle_metallic)
-            
-            def on_toggle_env(sender, app_data):
-                self.show_env_bg = bool(app_data)
-                render_callback()
             dpg.add_checkbox(label="HDRI as background", default_value=self.show_env_bg, callback=on_toggle_env)
+
+            dpg.add_separator()
+            dpg.add_text("Environment")
+            dpg.add_combo(items=self.hdri_labels,
+                          default_value=self.hdri_label_current,
+                          label="HDRI Preset",
+                          callback=on_hdri_change)
+            dpg.add_text(f"HDRI:\n{self.hdri_paths[self.hdri_label_current]}", tag="hdri_path_text")
 
             dpg.add_separator()
             dpg.add_button(label="Render", callback=render_callback)
 
             dpg.add_separator()
             dpg.add_text(f"Checkpoint:\n{self.args.checkpoint}")
-            dpg.add_text(f"HDRI:\n{self.args.hdri}")
 
         with dpg.window(label="Render",  tag="Render", width=self.args.width - 410, height=self.args.height - 40, pos=(400, 10)):
             dpg.add_image(texture_tag=self.texture_id, tag="render_image")
@@ -425,7 +543,7 @@ class RelightViewer:
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("Render", True)
-        # dpg.start_dearpygui()
+
         while dpg.is_dearpygui_running():
             # ---- keyboard controls ----
             if dpg.is_key_down(dpg.mvKey_W):
@@ -451,36 +569,15 @@ class RelightViewer:
             if dpg.is_key_down(dpg.mvKey_Right):
                 self.camera.orbit(-0.1, 0.0)
 
-            # ---- mouse orbit ----
-            # if dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
-            #     dx, dy = dpg.get_mouse_drag_delta()
-            #     sensitivity = 0.005  # radians per pixel
-            #     self.orbit_azimuth += dx * sensitivity
-            #     self.orbit_elevation += dy * sensitivity
-
-            #     # clamp elevation to avoid flipping
-            #     self.orbit_elevation = np.clip(self.orbit_elevation, -math.pi/2 + 0.01, math.pi/2 - 0.01)
-
-            #     # update camera
-            #     self.camera.look_at_orbit(
-            #         target=self.target,
-            #         radius=self.orbit_radius,
-            #         azimuth=self.orbit_azimuth,
-            #         elevation=self.orbit_elevation,
-            #     )
-
-
             # ---- render ----
             render_callback()
             dpg.render_dearpygui_frame()
 
         dpg.destroy_context()
 
-
 # -----------------------------
 # CLI
 # -----------------------------
-
 if __name__ == "__main__":
     parser = ArgumentParser(description="GS-IR PBR DearPyGui Viewer")
     model = ModelParams(parser, sentinel=True)
