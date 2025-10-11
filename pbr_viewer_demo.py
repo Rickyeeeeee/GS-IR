@@ -29,7 +29,7 @@ from utils.viewer_utils import get_canonical_rays, tensor_to_raw_rgba, euler_to_
 from viewer_camera import ViewerCamera
 
 # -----------------------------
-# HDRI PRESETS 
+# HDRI PRESETS
 # -----------------------------
 # Note: These are now just filenames. Provide the root path via the --hdri_root argument.
 HDRI_PRESETS: List[Tuple[str, str]] = [
@@ -68,20 +68,28 @@ class RelightViewer:
             self._load_checkpoint(gaussians, ckpt_path)
             self.models.append(gaussians)
             self.model_names.append(model_name)
-        
+
         # This is the single model used for rendering after concatenation
         self.render_gaussians = GaussianModel(args.sh_degree)
-        
+
         # --- NEW: Per-model transform states ---
         self.model_transforms = [
-            {'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0} for _ in self.models
+            {
+                'yaw': 0.0,
+                'pitch': 0.0,
+                'roll': 0.0,
+                'translation': [0.0, 0.0, 0.0],
+                'scale': 1.0,
+            }
+            for _ in self.models
         ]
         self.active_model_idx = 0
+        self.render_jointly = False # NEW: Flag for render mode
 
         # Base Gaussian Rotation Fix (the original hardcoded R_fix)
         self.base_R_fix = torch.from_numpy(euler_to_matrix(
-            torch.deg2rad(torch.tensor(0.0)), 
-            torch.deg2rad(torch.tensor(90.0)), 
+            torch.deg2rad(torch.tensor(0.0)),
+            torch.deg2rad(torch.tensor(90.0)),
             torch.deg2rad(torch.tensor(0.0)))).cuda()
 
         # HDRI presets & cache
@@ -90,22 +98,22 @@ class RelightViewer:
             print(f"[viewer] Loading HDRI presets from: {args.hdri_root}")
             for label, filename in HDRI_PRESETS:
                 full_path_presets.append((label, os.path.join(args.hdri_root, filename)))
-        
+
         self.hdri_presets: List[Tuple[str, str]] = full_path_presets
 
         if args.hdri is not None:
             if not any(os.path.normpath(p) == os.path.normpath(args.hdri) for _, p in self.hdri_presets):
                 self.hdri_presets.insert(0, ("(from --hdri)", args.hdri))
-        
+
         if not self.hdri_presets:
             raise ValueError("No HDRIs found. Please provide a valid --hdri_root directory or a specific --hdri file.")
 
         self.hdri_labels = [lbl for (lbl, _) in self.hdri_presets]
         self.hdri_paths = {lbl: path for (lbl, path) in self.hdri_presets}
         self.hdri_label_current = self._label_from_path(args.hdri) if args.hdri else self.hdri_labels[0]
-        
-        self.hdri_cache_latlong: Dict[str, torch.Tensor] = {} 
-        self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {} 
+
+        self.hdri_cache_latlong: Dict[str, torch.Tensor] = {}
+        self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {}
 
         # Light & BRDF
         self.light = CubemapLight(base_res=args.env_res).to(self.device)
@@ -120,14 +128,14 @@ class RelightViewer:
         # Target the center of the first model
         self.target = self.models[0].get_xyz.mean(dim=0).detach().cpu().numpy()
         self.camera.look_at(self.target, distance=1.0)
-        
+
         # Render state & UI controls
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
         self.enable_tone = args.tone
         self.enable_gamma = args.gamma
         self.enable_metallic = args.metallic
         self.show_env_bg = not getattr(args, "no_env_bg", False)
-        
+
         self.hdri_rotation_deg = 0.0 # Yaw for the environment map
 
         # DearPyGui state
@@ -165,95 +173,116 @@ class RelightViewer:
         model_params = checkpoint.get("gaussians", checkpoint) if isinstance(checkpoint, Dict) else checkpoint[0]
         gaussians.restore(model_params)
 
-    # ---------------------------------------------------
-    # NEW: Function to concatenate Gaussians before render
-    # ---------------------------------------------------
-    def _concatenate_gaussians(self):
-        """
-        Apply individual transforms and concatenate all models into a single
-        GaussianModel for rendering.
-        
-        <<< IMPLEMENT YOUR CONCATENATION LOGIC HERE >>>
-        """
-        # Example Implementation (replace with your own logic):
-        # This is a basic example. You might need more sophisticated handling of
-        # all the different tensor attributes of the GaussianModel.
-        
-        all_xyz = []
-        all_normals = []
-        all_rotations = []
-        # ... gather all other attributes like features, scaling, opacity ...
+    def _prepare_render_gaussians(self):
+        """Prepares the self.render_gaussians object by either concatenating
+        all models or just using the active one, based on the UI."""
+        if self.render_jointly:
+            self._concatenate_gaussians()
+        else:
+            self._use_individual_gaussian()
 
-        for i, model in enumerate(self.models):
-            trans = self.model_transforms[i]
-            
-            # Get the original, unmodified data for this model
-            xyz = model.get_xyz.clone().detach()
-            normal = model.get_normal.clone().detach()
-            rotation = model.get_rotation.clone().detach()
-
-            # 1. Calculate user-defined rotation for this model
-            R_user = torch.from_numpy(euler_to_matrix(
-                torch.deg2rad(torch.tensor(trans['yaw'])), 
-                torch.deg2rad(torch.tensor(trans['pitch'])), 
-                torch.deg2rad(torch.tensor(trans['roll'])))).cuda()
-        
-            # 2. Combine with the original fixed rotation
-            R_combined = R_user @ self.base_R_fix[:3, :3]
-        
-            # 3. Apply the combined rotation
-            transformed_xyz = (R_combined @ xyz.T).T
-            transformed_normal = (R_combined @ normal.T).T
-            transformed_rotation = rotation_to_quaternion(R_combined @ build_rotation(rotation))
-
-            # 4. Append transformed tensors to lists
-            all_xyz.append(transformed_xyz)
-            all_normals.append(transformed_normal)
-            all_rotations.append(transformed_rotation)
-            # ... append other attributes ...
-
-        # After the loop, concatenate all lists of tensors
-        # self.render_gaussians._xyz = torch.cat(all_xyz, dim=0)
-        # self.render_gaussians._normal = torch.cat(all_normals, dim=0)
-        # self.render_gaussians._rotation = torch.cat(all_rotations, dim=0)
-        # ... and so on for all other attributes ...
-
-        # For now, as a placeholder, we just render the active model
-        # Replace this with your full concatenated model
+    def _use_individual_gaussian(self):
+        """Applies the transform to the currently active model and sets it
+        as the render target."""
         active_model = self.models[self.active_model_idx]
         trans = self.model_transforms[self.active_model_idx]
         R_user = torch.from_numpy(euler_to_matrix(
-            torch.deg2rad(torch.tensor(trans['yaw'])), 
-            torch.deg2rad(torch.tensor(trans['pitch'])), 
+            torch.deg2rad(torch.tensor(trans['yaw'])),
+            torch.deg2rad(torch.tensor(trans['pitch'])),
             torch.deg2rad(torch.tensor(trans['roll'])))).cuda()
         R_combined = R_user @ self.base_R_fix[:3, :3]
-        
-        self.render_gaussians._xyz = (R_combined @ active_model.get_xyz.T).T
+
+        # Assign all attributes from the transformed active model
+        translation = torch.tensor(
+            trans['translation'],
+            device=active_model.get_xyz.device,
+            dtype=active_model.get_xyz.dtype,
+        )
+        scale_offset = torch.log(
+            torch.tensor(
+                max(trans['scale'], 1e-6),
+                device=active_model._scaling.device,
+                dtype=active_model._scaling.dtype,
+            )
+        )
+
+        self.render_gaussians._xyz = (R_combined @ active_model.get_xyz.T).T + translation
         self.render_gaussians._normal = (R_combined @ active_model.get_normal.T).T
         self.render_gaussians._rotation = rotation_to_quaternion(R_combined @ build_rotation(active_model.get_rotation))
         self.render_gaussians._features_dc = active_model._features_dc
         self.render_gaussians._features_rest = active_model._features_rest
-        self.render_gaussians._scaling = active_model._scaling
+        self.render_gaussians._scaling = active_model._scaling + scale_offset
         self.render_gaussians._opacity = active_model._opacity
         self.render_gaussians._albedo = active_model._albedo
         self.render_gaussians._roughness = active_model._roughness
         self.render_gaussians._metallic = active_model._metallic
 
+    def _concatenate_gaussians(self):
+        """Applies individual transforms and concatenates all models into a
+        single GaussianModel for rendering."""
+        all_attrs = {
+            '_xyz': [], '_normal': [], '_rotation': [], '_features_dc': [],
+            '_features_rest': [], '_scaling': [], '_opacity': [], '_albedo': [],
+            '_roughness': [], '_metallic': []
+        }
+
+        for i, model in enumerate(self.models):
+            trans = self.model_transforms[i]
+
+            # Calculate user-defined rotation for this model
+            R_user = torch.from_numpy(euler_to_matrix(
+                torch.deg2rad(torch.tensor(trans['yaw'])),
+                torch.deg2rad(torch.tensor(trans['pitch'])),
+                torch.deg2rad(torch.tensor(trans['roll'])))).cuda()
+
+            # Combine with the original fixed rotation
+            R_combined = R_user @ self.base_R_fix[:3, :3]
+
+            # Apply the combined rotation
+            translation = torch.tensor(
+                trans['translation'],
+                device=model.get_xyz.device,
+                dtype=model.get_xyz.dtype,
+            )
+            scale_offset = torch.log(
+                torch.tensor(
+                    max(trans['scale'], 1e-6),
+                    device=model._scaling.device,
+                    dtype=model._scaling.dtype,
+                )
+            )
+
+            all_attrs['_xyz'].append((R_combined @ model.get_xyz.T).T + translation)
+            all_attrs['_normal'].append((R_combined @ model.get_normal.T).T)
+            all_attrs['_rotation'].append(rotation_to_quaternion(R_combined @ build_rotation(model.get_rotation)))
+
+            # Append non-transformed attributes
+            all_attrs['_features_dc'].append(model._features_dc)
+            all_attrs['_features_rest'].append(model._features_rest)
+            all_attrs['_scaling'].append(model._scaling + scale_offset)
+            all_attrs['_opacity'].append(model._opacity)
+            all_attrs['_albedo'].append(model._albedo)
+            all_attrs['_roughness'].append(model._roughness)
+            all_attrs['_metallic'].append(model._metallic)
+
+        # Concatenate all lists of tensors and assign to the render model
+        for attr_name, tensor_list in all_attrs.items():
+            setattr(self.render_gaussians, attr_name, torch.cat(tensor_list, dim=0))
 
     # -------------------------
     # Rendering
     # -------------------------
     @torch.no_grad()
     def render_current(self) -> torch.Tensor:
-        
-        # --- NEW: Prepare the combined model for rendering ---
-        self._concatenate_gaussians()
-        
+
+        # --- NEW: Prepare the gaussians based on the selected render mode ---
+        self._prepare_render_gaussians()
+
         view = self.camera
 
         # GS-IR forward pass
         rendering_result = render(
-            viewpoint_camera=view, pc=self.render_gaussians, pipe=self.args.pipeline, 
+            viewpoint_camera=view, pc=self.render_gaussians, pipe=self.args.pipeline,
             bg_color=self.background, inference=True, pad_normal=True, derive_normal=True,
         )
 
@@ -275,9 +304,9 @@ class RelightViewer:
         env_yaw_rad = math.radians(self.hdri_rotation_deg)
         env_cos_yaw = math.cos(env_yaw_rad)
         env_sin_yaw = math.sin(env_yaw_rad)
-        
+
         x, y, z = view_dirs[..., 0], view_dirs[..., 1], view_dirs[..., 2]
-        
+
         # R_y(yaw) on view directions
         x_rotated = x * env_cos_yaw - z * env_sin_yaw
         z_rotated = x * env_sin_yaw + z * env_cos_yaw
@@ -288,7 +317,7 @@ class RelightViewer:
         result = pbr_shading(
             light=self.light,
             normals=normal_map.permute(1, 2, 0),
-            view_dirs=light_sample_dirs,        
+            view_dirs=light_sample_dirs,
             mask=rendering_result["normal_mask"].permute(1, 2, 0),
             albedo=albedo_map.permute(1, 2, 0),
             roughness=roughness_map.permute(1, 2, 0),
@@ -301,7 +330,7 @@ class RelightViewer:
 
         # Composite the HDRI as a background (uses ROTATED direction vector)
         if self.show_env_bg:
-            env_rgb = _sample_env_latlong(self.hdri, light_sample_dirs) 
+            env_rgb = _sample_env_latlong(self.hdri, light_sample_dirs)
             if self.enable_tone:
                 env_rgb = _aces_film(env_rgb)
             if self.enable_gamma:
@@ -317,7 +346,7 @@ class RelightViewer:
     def _update_image(self, img_rgb: torch.Tensor):
         H, W, _ = img_rgb.shape
         rgba_np = tensor_to_raw_rgba(img_rgb)
-        
+
         if self.texture_id is None or self.tex_size != (W, H):
             try:
                 if self.texture_id is not None: dpg.delete_item(self.texture_id)
@@ -372,7 +401,11 @@ class RelightViewer:
         def on_toggle_env(sender, app_data): self.show_env_bg = bool(app_data); render_callback()
         def on_hdri_rotation_change(sender, app_data): self.hdri_rotation_deg = app_data; render_callback()
         
-        # --- NEW: Callbacks for model transforms ---
+        # --- Callbacks for model transforms ---
+        def on_render_mode_change(sender, app_data):
+            self.render_jointly = (app_data == "Joint (Concatenated)")
+            render_callback()
+
         def on_active_model_change(sender, app_data):
             # Find the index of the selected model name
             self.active_model_idx = self.model_names.index(app_data)
@@ -381,18 +414,38 @@ class RelightViewer:
             dpg.set_value("model_yaw", trans['yaw'])
             dpg.set_value("model_pitch", trans['pitch'])
             dpg.set_value("model_roll", trans['roll'])
+            dpg.set_value("model_translation_x", trans['translation'][0])
+            dpg.set_value("model_translation_y", trans['translation'][1])
+            dpg.set_value("model_translation_z", trans['translation'][2])
+            dpg.set_value("model_scale", trans['scale'])
             render_callback()
 
         def on_model_yaw_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['yaw'] = app_data
             render_callback()
-        
+
         def on_model_pitch_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['pitch'] = app_data
             render_callback()
 
         def on_model_roll_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['roll'] = app_data
+            render_callback()
+
+        def on_model_translation_x_change(sender, app_data):
+            self.model_transforms[self.active_model_idx]['translation'][0] = app_data
+            render_callback()
+
+        def on_model_translation_y_change(sender, app_data):
+            self.model_transforms[self.active_model_idx]['translation'][1] = app_data
+            render_callback()
+
+        def on_model_translation_z_change(sender, app_data):
+            self.model_transforms[self.active_model_idx]['translation'][2] = app_data
+            render_callback()
+
+        def on_model_scale_change(sender, app_data):
+            self.model_transforms[self.active_model_idx]['scale'] = app_data
             render_callback()
 
         def on_hdri_change(sender, app_data):
@@ -407,14 +460,24 @@ class RelightViewer:
         with dpg.window(label="Controls", width=380, height=-1, pos=(10, 10)):
             dpg.add_text("FPS: --", tag="fps_display")
             dpg.add_text("Frame Time: -- ms", tag="frametime_display")
-            
+
             dpg.add_separator()
             dpg.add_text("Model Controls")
+            dpg.add_radio_button(
+                items=["Joint (Concatenated)", "Individual (Active Model)"],
+                default_value="Individual (Active Model)",
+                callback=on_render_mode_change,
+                horizontal=True
+            )
             dpg.add_combo(items=self.model_names, default_value=self.model_names[0], label="Active Model", callback=on_active_model_change)
             dpg.add_slider_float(label="Model Yaw", tag="model_yaw", min_value=-180.0, max_value=180.0, default_value=0.0, format="%.1f deg", callback=on_model_yaw_change)
             dpg.add_slider_float(label="Model Pitch", tag="model_pitch", min_value=-180.0, max_value=180.0, default_value=0.0, format="%.1f deg", callback=on_model_pitch_change)
             dpg.add_slider_float(label="Model Roll", tag="model_roll", min_value=-180.0, max_value=180.0, default_value=0.0, format="%.1f deg", callback=on_model_roll_change)
-            
+            dpg.add_drag_float(label="Translate X", tag="model_translation_x", speed=0.01, min_value=-10.0, max_value=10.0, default_value=0.0, format="%.3f", callback=on_model_translation_x_change)
+            dpg.add_drag_float(label="Translate Y", tag="model_translation_y", speed=0.01, min_value=-10.0, max_value=10.0, default_value=0.0, format="%.3f", callback=on_model_translation_y_change)
+            dpg.add_drag_float(label="Translate Z", tag="model_translation_z", speed=0.01, min_value=-10.0, max_value=10.0, default_value=0.0, format="%.3f", callback=on_model_translation_z_change)
+            dpg.add_slider_float(label="Model Scale", tag="model_scale", min_value=0.1, max_value=5.0, default_value=1.0, format="%.2f", callback=on_model_scale_change)
+
             dpg.add_separator()
             dpg.add_text("Environment")
             dpg.add_combo(items=self.hdri_labels, default_value=self.hdri_label_current, label="HDRI Preset", callback=on_hdri_change)
@@ -451,7 +514,7 @@ class RelightViewer:
             now = time.perf_counter()
             dt = min(now - _last_time, MAX_DT)
             _last_time = now
-            
+
             if dt > 0.0:
                 dpg.set_value("fps_display", f"FPS: {1.0 / dt:.1f}")
                 dpg.set_value("frametime_display", f"Frame Time: {dt * 1000.0:.2f} ms")
