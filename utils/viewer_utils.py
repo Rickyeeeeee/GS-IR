@@ -75,7 +75,7 @@ def _sample_env_latlong(latlong_map: torch.Tensor, dirs: torch.Tensor) -> torch.
     """
     rotation_matrix = torch.tensor(
         euler_to_matrix(
-           torch.deg2rad(torch.tensor(45.0)), 
+           torch.deg2rad(torch.tensor(180.0)), 
            torch.deg2rad(torch.tensor(0.0)), 
            torch.deg2rad(torch.tensor(0.0)) 
         ), dtype=dirs.dtype, device=dirs.device)

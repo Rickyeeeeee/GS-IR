@@ -244,6 +244,8 @@ def launch(
     irradiance_volumes.load_state_dict(irradiance_volumes_params)
     irradiance_volumes.eval()
 
+    scene.save(40000)
+
     if brdf_eval:
         if not skip_train:
             eval_brdf(

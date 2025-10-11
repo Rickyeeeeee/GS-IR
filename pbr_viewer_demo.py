@@ -1,18 +1,9 @@
-# viewer.py
-#
-# Dear PyGui viewer for GS-IR relighting with PBR shading.
-#
-# Requirements (available in your GS-IR repo):
-#   arguments.py, gaussian_renderer.py, pbr.py, scene.py, utils.*
-# Plus: dearpygui, nvdiffrast.torch, torchvision, torch, numpy, opencv
-#
-
 import os
 import math
+import json
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple, Optional
 import time
-import json
 
 import numpy as np
 import torch
@@ -31,41 +22,74 @@ from viewer_camera import ViewerCamera
 # -----------------------------
 # HDRI PRESETS 
 # -----------------------------
-# Note: These are now just filenames. Provide the root path via the --hdri_root argument.
 HDRI_PRESETS: List[Tuple[str, str]] = [
-    ("Bridge", "bridge.hdr"),
-    ("City", "city.hdr"),
-    ("Courtyard", "courtyard.hdr"),
-    ("Fireplace", "fireplace.hdr"),
-    ("Forest", "forest.hdr"),
-    ("Interior", "interior.hdr"),
-    ("Museum", "museum.hdr"),
-    ("Night", "night.hdr"),
-    ("Snow", "snow.hdr"),
-    ("Square", "square.hdr"),
-    ("Studio", "studio.hdr"),
-    ("Sunrise", "sunrise.hdr"),
-    ("Sunset", "sunset.hdr"),
-    ("Tunnel", "tunnel.hdr"),
+    ("Bridge", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/bridge.hdr"),
+    ("City", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/city.hdr"),
+    ("Courtyard", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/courtyard.hdr"),
+    ("Fireplace", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/fireplace.hdr"),
+    ("Forest", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/forest.hdr"),
+    ("Interior", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/interior.hdr"),
+    ("Museum", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/museum.hdr"),
+    ("Night", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/night.hdr"),
+    ("Snow", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/snow.hdr"),
+    ("Square", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/square.hdr"),
+    ("Studio", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/studio.hdr"),
+    ("Sunrise", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/sunrise.hdr"),
+    ("Sunset", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/sunset.hdr"),
+    ("Tunnel", "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/tunnel.hdr"),
 ]
+
+# -----------------------------
+# Model Instance Container
+# -----------------------------
+class ModelInstance:
+    """Container for a single Gaussian model, its base data, and UI-controlled transforms."""
+    def __init__(self, checkpoint_path: str, sh_degree: int):
+        self.checkpoint_path = checkpoint_path
+        self.gaussians = GaussianModel(sh_degree)
+        self._load_checkpoint(checkpoint_path)
+
+        # Store original, untransformed data
+        self.base_xyz = self.gaussians.get_xyz.clone().detach()
+        self.base_rotation = self.gaussians.get_rotation.clone().detach()
+        self.base_normal = self.gaussians.get_normal.clone().detach()
+        self.base_features_dc = self.gaussians.get_features_dc.clone().detach()
+        self.base_features_rest = self.gaussians.get_features_rest.clone().detach()
+        self.base_scaling = self.gaussians.get_scaling.clone().detach()
+        self.base_opacity = self.gaussians.get_opacity.clone().detach()
+
+        # Transform controls (manipulated by UI)
+        self.yaw_deg, self.pitch_deg, self.roll_deg = 0.0, 0.0, 0.0
+        self.tx, self.ty, self.tz = 0.0, 0.0, 0.0
+
+    def _load_checkpoint(self, ckpt_path: str):
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        print(f"[viewer] Loading checkpoint: {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location="cuda")
+        model_params = checkpoint.get("gaussians", checkpoint)
+        self.gaussians.restore(model_params)
 
 # -----------------------------
 # Viewer App
 # -----------------------------
-
 class RelightViewer:
     def __init__(self, args):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # GS-IR scene & model
-        self.gaussians = GaussianModel(args.sh_degree)
-        self._load_checkpoint(args.checkpoint)
+        # --- NEW: Load multiple models ---
+        self.models: List[ModelInstance] = []
+        for ckpt_path in args.checkpoints:
+            try:
+                self.models.append(ModelInstance(ckpt_path, args.sh_degree))
+            except Exception as e:
+                print(f"Failed to load model {ckpt_path}: {e}")
+        if not self.models:
+            raise RuntimeError("No models could be loaded. Aborting.")
 
-        # Base Gaussian data (original state for rotation application)
-        self.xyz = self.gaussians.get_xyz.clone().detach()
-        self.rotation = self.gaussians.get_rotation.clone().detach()
-        self.normal = self.gaussians.get_normal.clone().detach()
+        # Combined model for rendering
+        self.render_gaussians = GaussianModel(args.sh_degree)
         
         # Base Gaussian Rotation Fix (the original hardcoded R_fix)
         self.base_R_fix = torch.from_numpy(euler_to_matrix(
@@ -74,30 +98,13 @@ class RelightViewer:
             torch.deg2rad(torch.tensor(0.0)))).cuda()
 
         # HDRI presets & cache
-        # Dynamically build preset paths from the --hdri_root argument
-        full_path_presets = []
-        if args.hdri_root and os.path.isdir(args.hdri_root):
-            print(f"[viewer] Loading HDRI presets from: {args.hdri_root}")
-            for label, filename in HDRI_PRESETS:
-                full_path_presets.append((label, os.path.join(args.hdri_root, filename)))
-        
-        self.hdri_presets: List[Tuple[str, str]] = full_path_presets
-
-        # Add the specific --hdri file if provided and not already in the list
+        self.hdri_presets: List[Tuple[str, str]] = list(HDRI_PRESETS)
         if args.hdri is not None:
             if not any(os.path.normpath(p) == os.path.normpath(args.hdri) for _, p in self.hdri_presets):
-                self.hdri_presets.insert(0, ("(from --hdri)", args.hdri))
-        
-        # Validate that we have at least one HDRI to work with
-        if not self.hdri_presets:
-            raise ValueError("No HDRIs found. Please provide a valid --hdri_root directory or a specific --hdri file.")
-
+                self.hdri_presets.insert(0, ("(from args)", args.hdri))
         self.hdri_labels = [lbl for (lbl, _) in self.hdri_presets]
         self.hdri_paths = {lbl: path for (lbl, path) in self.hdri_presets}
-        
-        # Set the current HDRI: use the one from --hdri if provided, otherwise the first in the list
         self.hdri_label_current = self._label_from_path(args.hdri) if args.hdri else self.hdri_labels[0]
-        
         self.hdri_cache_latlong: Dict[str, torch.Tensor] = {} 
         self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {} 
 
@@ -108,11 +115,18 @@ class RelightViewer:
         self.light.eval()
 
         # Camera setup
+        # Use first model's scene info to initialize camera
+        temp_scene_for_cam = Scene(args, self.models[0].gaussians, shuffle=False)
+        cams = temp_scene_for_cam.getTrainCameras() or temp_scene_for_cam.getTestCameras()
+        current_view = cams[0]
         self.camera = ViewerCamera(
-            FoVx=1.6609910500147054, FoVy=1.103431263015383, W=959, H=539, data_device="cuda"
+            FoVx=current_view.FoVx, FoVy=current_view.FoVy, W=current_view.image_width, H=current_view.image_height, data_device="cuda"
         )
-        self.target = self.gaussians.get_xyz.mean(dim=0).detach().cpu().numpy()
-        self.camera.look_at(self.target, distance=1.0)
+        
+        # Target the center of all loaded models combined
+        all_xyz = torch.cat([m.base_xyz for m in self.models], dim=0)
+        self.target = all_xyz.mean(dim=0).detach().cpu().numpy()
+        self.camera.look_at(self.target, distance=2.0)
         
         # Render state & UI controls
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
@@ -121,10 +135,6 @@ class RelightViewer:
         self.enable_metallic = args.metallic
         self.show_env_bg = not getattr(args, "no_env_bg", False)
         
-        # NEW: Rotation states
-        self.gaussian_yaw_deg = 0.0 # Yaw for the Gaussian scene object
-        self.gaussian_pitch_deg = 0.0 # Yaw for the Gaussian scene object
-        self.gaussian_roll_deg = 0.0 # Yaw for the Gaussian scene object
         self.hdri_rotation_deg = 0.0 # Yaw for the environment map
 
         # DearPyGui state
@@ -132,9 +142,7 @@ class RelightViewer:
         self.tex_size = (0, 0)
         self.last_mouse_pos = None
 
-    # ----- HDRI helpers -----
     def _label_from_path(self, path: str) -> str:
-        if path is None: return None
         norm = os.path.normpath(path)
         for lbl, p in self.hdri_presets:
             if os.path.normpath(p) == norm:
@@ -155,40 +163,55 @@ class RelightViewer:
         self.light.base.data = self.hdri_cache_cubemap[label]
         self.light.build_mips()
 
-    def _load_checkpoint(self, ckpt_path: str):
-        if not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        print(f"[viewer] Loading checkpoint: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path)
-        model_params = checkpoint.get("gaussians", checkpoint) if isinstance(checkpoint, Dict) else checkpoint[0]
-        self.gaussians.restore(model_params)
-
     # -------------------------
     # Rendering
     # -------------------------
     @torch.no_grad()
     def render_current(self) -> torch.Tensor:
-        # --- Gaussian Scene Rotation ---
+        # --- NEW: Apply individual transforms and concatenate all models ---
+        all_xyz, all_rot, all_norm = [], [], []
+        all_feat_dc, all_feat_rest, all_scale, all_opacity = [], [], [], []
 
-        R_user = torch.from_numpy(euler_to_matrix(
-            torch.deg2rad(torch.tensor(self.gaussian_yaw_deg)), 
-            torch.deg2rad(torch.tensor(self.gaussian_pitch_deg)), 
-            torch.deg2rad(torch.tensor(self.gaussian_roll_deg)))).cuda()
+        for model in self.models:
+            # 1. User-defined rotation and translation for this model
+            R_user = torch.from_numpy(euler_to_matrix(
+                torch.deg2rad(torch.tensor(model.yaw_deg)), 
+                torch.deg2rad(torch.tensor(model.pitch_deg)), 
+                torch.deg2rad(torch.tensor(model.roll_deg)))).cuda()
+            T_user = torch.tensor([model.tx, model.ty, model.tz], device=self.device)
+            
+            # 2. Combine with the original fixed rotation
+            R_combined = R_user @ self.base_R_fix[:3, :3]
+            
+            # 3. Apply transformation
+            xyz = (R_combined @ model.base_xyz.T).T + T_user
+            normal = (R_combined @ model.base_normal.T).T
+            rotation = rotation_to_quaternion(R_combined @ build_rotation(model.base_rotation))
+            
+            # 4. Collect attributes
+            all_xyz.append(xyz)
+            all_rot.append(rotation)
+            all_norm.append(normal)
+            all_feat_dc.append(model.base_features_dc)
+            all_feat_rest.append(model.base_features_rest)
+            all_scale.append(model.base_scaling)
+            all_opacity.append(model.base_opacity)
         
-        # 2. Combine with the original fixed rotation
-        R_combined = R_user @ self.base_R_fix[:3, :3]
-        
-        # 3. Apply the combined rotation to positions and rotations
-        self.gaussians._xyz = (R_combined @ self.xyz.T).T
-        self.gaussians._normal = (R_combined @ self.normal.T).T
-        self.gaussians._rotation = rotation_to_quaternion(R_combined @ build_rotation(self.rotation))
-        # -------------------------------
+        # 5. Concatenate into single tensors
+        self.render_gaussians._xyz = torch.cat(all_xyz, dim=0)
+        self.render_gaussians._rotation = torch.cat(all_rot, dim=0)
+        self.render_gaussians._normal = torch.cat(all_norm, dim=0)
+        self.render_gaussians._features_dc = torch.cat(all_feat_dc, dim=0)
+        self.render_gaussians._features_rest = torch.cat(all_feat_rest, dim=0)
+        self.render_gaussians._scaling = torch.cat(all_scale, dim=0)
+        self.render_gaussians._opacity = torch.cat(all_opacity, dim=0)
+        # -----------------------------------------------------------------
         
         view = self.camera
 
         # GS-IR forward pass
         rendering_result = render(
-            viewpoint_camera=view, pc=self.gaussians, pipe=self.args.pipeline, 
+            viewpoint_camera=view, pc=self.render_gaussians, pipe=self.args.pipeline, 
             bg_color=self.background, inference=True, pad_normal=True, derive_normal=True,
         )
 
@@ -204,26 +227,21 @@ class RelightViewer:
         canonical_rays = get_canonical_rays(H, W, self.camera.FoVx, self.camera.FoVy)
         view_dirs = -(
             (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3]).sum(dim=-1).reshape(H, W, 3)
-        )  # [H,W,3]
+        )
 
-        # --- HDRI Environment Rotation (Yaw) ---
+        # HDRI Environment Rotation (Yaw)
         env_yaw_rad = math.radians(self.hdri_rotation_deg)
-        env_cos_yaw = math.cos(env_yaw_rad)
-        env_sin_yaw = math.sin(env_yaw_rad)
-        
+        env_cos_yaw, env_sin_yaw = math.cos(env_yaw_rad), math.sin(env_yaw_rad)
         x, y, z = view_dirs[..., 0], view_dirs[..., 1], view_dirs[..., 2]
-        
-        # R_y(yaw) on view directions
         x_rotated = x * env_cos_yaw - z * env_sin_yaw
         z_rotated = x * env_sin_yaw + z * env_cos_yaw
-        light_sample_dirs = torch.stack([x_rotated, y, z_rotated], dim=-1) # [H,W,3]
-        # ---------------------------------------
+        light_sample_dirs = torch.stack([x_rotated, y, z_rotated], dim=-1)
 
-        # PBR shading (uses ROTATED direction vector for environment map sampling)
+        # PBR shading
         result = pbr_shading(
             light=self.light,
             normals=normal_map.permute(1, 2, 0),
-            view_dirs=light_sample_dirs,        
+            view_dirs=light_sample_dirs,         
             mask=rendering_result["normal_mask"].permute(1, 2, 0),
             albedo=albedo_map.permute(1, 2, 0),
             roughness=roughness_map.permute(1, 2, 0),
@@ -234,13 +252,11 @@ class RelightViewer:
         )
         render_rgb = result["render_rgb"].clamp(0.0, 1.0)
 
-        # Composite the HDRI as a background (uses ROTATED direction vector)
+        # Composite the HDRI as a background
         if self.show_env_bg:
             env_rgb = _sample_env_latlong(self.hdri, light_sample_dirs) 
-            if self.enable_tone:
-                env_rgb = _aces_film(env_rgb)
-            if self.enable_gamma:
-                env_rgb = _linear_to_srgb(env_rgb)
+            if self.enable_tone: env_rgb = _aces_film(env_rgb)
+            if self.enable_gamma: env_rgb = _linear_to_srgb(env_rgb)
             bg_mask = 1.0 - opacity_mask.permute(1, 2, 0).clamp(0.0, 1.0)
             render_rgb = render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
 
@@ -254,9 +270,9 @@ class RelightViewer:
         rgba_np = tensor_to_raw_rgba(img_rgb)
         
         if self.texture_id is None or self.tex_size != (W, H):
-            try:
-                if self.texture_id is not None: dpg.delete_item(self.texture_id)
-            except Exception: pass
+            if self.texture_id is not None:
+                try: dpg.delete_item(self.texture_id)
+                except Exception: pass
             with dpg.texture_registry(show=False):
                 self.texture_id = dpg.add_raw_texture(W, H, rgba_np, format=dpg.mvFormat_Float_rgba)
             self.tex_size = (W, H)
@@ -270,21 +286,10 @@ class RelightViewer:
         img = self.render_current()
         H, W, _ = img.shape
 
-        dpg.create_viewport(title="GS-IR PBR Viewer", width=self.args.width, height=self.args.height)
+        dpg.create_viewport(title="GS-IR Multi-Model PBR Viewer", width=self.args.width, height=self.args.height)
 
         with dpg.texture_registry(show=False):
             self.texture_id = dpg.add_raw_texture(W, H, tensor_to_raw_rgba(img), format=dpg.mvFormat_Float_rgba)
-
-        # --- Helpers ---
-        def _rebuild_projection_for(camera, w: int, h: int):
-            if w <= 0 or h <= 0: return
-            aspect = float(w) / float(h)
-            tan_half_y = float(camera.FoVy)
-            tan_half_x = tan_half_y * aspect
-            camera.FoVx, camera.FoVy = tan_half_x, tan_half_y
-            camera.projection_matrix = (getProjectionMatrix(znear=camera.znear, zfar=camera.zfar, fovX=camera.FoVx, fovY=camera.FoVy).transpose(0, 1).to(camera.data_device))
-            camera.update_matrices()
-            camera.image = torch.zeros((3, h, w), dtype=torch.float32)
 
         def render_callback(sender=None, app_data=None):
             try:
@@ -296,55 +301,61 @@ class RelightViewer:
 
         def _apply_resize(new_w: int, new_h: int):
             if new_w <= 0 or new_h <= 0: return
-            _rebuild_projection_for(self.camera, new_w, new_h)
+            self.camera.update_resolution(new_h, new_w)
             if dpg.does_item_exist("render_image"):
                 dpg.configure_item("render_image", width=new_w - 20, height=new_h - 20)
             render_callback()
 
         # --- UI Callbacks ---
-        def on_toggle_tone(sender, app_data): self.enable_tone = bool(app_data); render_callback()
-        def on_toggle_gamma(sender, app_data): self.enable_gamma = bool(app_data); render_callback()
-        def on_toggle_env(sender, app_data): self.show_env_bg = bool(app_data); render_callback()
-        def on_gaussian_rotation_yaw_change(sender, app_data): self.gaussian_yaw_deg = app_data; render_callback()
-        def on_gaussian_rotation_pitch_change(sender, app_data): self.gaussian_pitch_deg = app_data; render_callback()
-        def on_gaussian_rotation_roll_change(sender, app_data): self.gaussian_roll_deg = app_data; render_callback()
-        def on_hdri_rotation_change(sender, app_data): self.hdri_rotation_deg = app_data; render_callback()
+        def on_toggle_tone(s, ad): self.enable_tone = bool(ad); render_callback()
+        def on_toggle_gamma(s, ad): self.enable_gamma = bool(ad); render_callback()
+        def on_toggle_env(s, ad): self.show_env_bg = bool(ad); render_callback()
+        def on_hdri_rotation_change(s, ad): self.hdri_rotation_deg = ad; render_callback()
 
+        # --- NEW: Model Transform Callbacks ---
+        def on_model_transform(sender, app_data, user_data):
+            model_idx, transform_type = user_data
+            model = self.models[model_idx]
+            if   transform_type == 'yaw': model.yaw_deg = app_data
+            elif transform_type == 'pitch': model.pitch_deg = app_data
+            elif transform_type == 'roll': model.roll_deg = app_data
+            elif transform_type == 'tx': model.tx = app_data
+            elif transform_type == 'ty': model.ty = app_data
+            elif transform_type == 'tz': model.tz = app_data
+            render_callback()
+        
         def on_hdri_change(sender, app_data):
             self.hdri_label_current = app_data
-            try:
-                self._ensure_hdri(self.hdri_label_current)
-            except Exception as e:
-                print(f"[viewer] HDRI switch error: {e}")
+            try: self._ensure_hdri(self.hdri_label_current)
+            except Exception as e: print(f"[viewer] HDRI switch error: {e}")
             render_callback()
 
         # --- Windows ---
         with dpg.window(label="Controls", width=380, height=-1, pos=(10, 10)):
             dpg.add_text("FPS: --", tag="fps_display")
             dpg.add_text("Frame Time: -- ms", tag="frametime_display")
+            dpg.add_button(label="Render Once", callback=render_callback, width=-1)
             
             dpg.add_separator()
-            dpg.add_text("Gaussian Controls")
-            dpg.add_slider_float(label="Gaussian Yaw", min_value=-180.0, max_value=180.0, default_value=self.gaussian_yaw_deg, format="%.1f deg", callback=on_gaussian_rotation_yaw_change)
-            dpg.add_slider_float(label="Gaussian Pitch", min_value=-180.0, max_value=180.0, default_value=self.gaussian_pitch_deg, format="%.1f deg", callback=on_gaussian_rotation_pitch_change)
-            dpg.add_slider_float(label="Gaussian Roll", min_value=-180.0, max_value=180.0, default_value=self.gaussian_roll_deg, format="%.1f deg", callback=on_gaussian_rotation_roll_change)
-            
-            dpg.add_separator()
-            dpg.add_text("Environment")
-            dpg.add_combo(items=self.hdri_labels, default_value=self.hdri_label_current, label="HDRI Preset", callback=on_hdri_change)
-            dpg.add_slider_float(label="HDRI Yaw", min_value=-180.0, max_value=180.0, default_value=self.hdri_rotation_deg, format="%.1f deg", callback=on_hdri_rotation_change)
-
-            dpg.add_separator()
-            dpg.add_text("Shading")
+            dpg.add_text("Shading & Environment")
             dpg.add_checkbox(label="ACES tone mapping", default_value=self.enable_tone, callback=on_toggle_tone)
             dpg.add_checkbox(label="Gamma correction (sRGB)", default_value=self.enable_gamma, callback=on_toggle_gamma)
             dpg.add_checkbox(label="HDRI as background", default_value=self.show_env_bg, callback=on_toggle_env)
-
+            dpg.add_combo(items=self.hdri_labels, default_value=self.hdri_label_current, label="HDRI Preset", callback=on_hdri_change)
+            dpg.add_slider_float(label="HDRI Yaw", min_value=-180, max_value=180, default_value=self.hdri_rotation_deg, callback=on_hdri_rotation_change)
+            
+            # --- NEW: Per-model transform controls ---
             dpg.add_separator()
-            dpg.add_button(label="Render Once", callback=render_callback)
-
-            dpg.add_separator()
-            dpg.add_text(f"Checkpoint:\n{self.args.checkpoint}")
+            dpg.add_text("Model Transforms")
+            for i, model in enumerate(self.models):
+                header_label = f"Model {i+1}: {os.path.basename(model.checkpoint_path)}"
+                with dpg.collapsing_header(label=header_label, default_open=True):
+                    dpg.add_slider_float(label="Yaw", min_value=-180, max_value=180, default_value=0, format="%.1f deg", user_data=(i, 'yaw'), callback=on_model_transform)
+                    dpg.add_slider_float(label="Pitch", min_value=-180, max_value=180, default_value=0, format="%.1f deg", user_data=(i, 'pitch'), callback=on_model_transform)
+                    dpg.add_slider_float(label="Roll", min_value=-180, max_value=180, default_value=0, format="%.1f deg", user_data=(i, 'roll'), callback=on_model_transform)
+                    dpg.add_slider_float(label="Translate X", min_value=-5, max_value=5, default_value=0, format="%.2f", user_data=(i, 'tx'), callback=on_model_transform)
+                    dpg.add_slider_float(label="Translate Y", min_value=-5, max_value=5, default_value=0, format="%.2f", user_data=(i, 'ty'), callback=on_model_transform)
+                    dpg.add_slider_float(label="Translate Z", min_value=-5, max_value=5, default_value=0, format="%.2f", user_data=(i, 'tz'), callback=on_model_transform)
 
         with dpg.window(label="Render", tag="Render", width=self.args.width - 410, height=self.args.height - 40, pos=(400, 10)):
             dpg.add_image(texture_tag=self.texture_id, tag="render_image", width=W, height=H)
@@ -400,19 +411,17 @@ class RelightViewer:
         dpg.destroy_context()
 
 # -----------------------------
-# CLI
+# CLI 
 # -----------------------------
 if __name__ == "__main__":
-    parser = ArgumentParser(description="GS-IR PBR DearPyGui Viewer")
-
-    # Define all arguments first
-    parser.add_argument("--config", type=str, default="config.json", help="Path to a JSON configuration file.")
+    parser = ArgumentParser(description="GS-IR Multi-Model PBR DearPyGui Viewer")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
 
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to GS-IR checkpoint to load.")
-    parser.add_argument("--hdri", type=str, default=None, help="Path to a specific latlong HDRI file (.hdr). Overrides presets.")
-    parser.add_argument("--hdri_root", type=str, default=None, help="Root directory containing HDRI files for presets.")
+    # --- NEW: Config file and multi-checkpoint support ---
+    parser.add_argument("--config", type=str, help="Path to a JSON config file.")
+    parser.add_argument("--checkpoints", type=str, nargs='+', help="Path(s) to GS-IR checkpoint(s) to load.")
+    parser.add_argument("--hdri", type=str, help="Path to latlong HDRI file (.hdr).")
     parser.add_argument("--env_res", type=int, default=256, help="Cubemap base resolution per face.")
     parser.add_argument("--width", type=int, default=1280, help="Viewer window width.")
     parser.add_argument("--height", type=int, default=720, help="Viewer window height.")
@@ -420,38 +429,29 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", action="store_true", help="Enable linear->sRGB gamma correction.")
     parser.add_argument("--metallic", action="store_true", help="Use reconstructed metallic map.")
     parser.add_argument("--no_env_bg", action="store_true", help="Disable compositing HDRI as background.")
+    
+    # Load from config file first, then override with CLI args
+    args, unknown = parser.parse_known_args()
+    if args.config:
+        with open(args.config, 'r') as f:
+            config_args = json.load(f)
+        # Set defaults from config file, allowing CLI to override
+        parser.set_defaults(**config_args)
+    
+    args = get_combined_args(parser)
 
-    # Temporarily parse for config path
-    temp_args, _ = parser.parse_known_args()
-
-    # Load defaults from config file if it exists, AFTER arguments are defined
-    if os.path.isfile(temp_args.config):
-        print(f"[viewer] Loading arguments from: {temp_args.config}")
-        with open(temp_args.config, 'r') as f:
-            config_data = json.load(f)
-        parser.set_defaults(**config_data)
-    else:
-        print(f"[viewer] Config file not found at '{temp_args.config}'. Using command-line arguments and defaults.")
-
-    # Now, parse all arguments with the correct defaults
-    args = parser.parse_args()
-
-    # --- Argument Validation ---
-    if not args.checkpoint:
-        parser.error("A --checkpoint must be provided either via command-line or config file.")
-
-    if not args.hdri and not args.hdri_root:
-        parser.error("An HDRI source must be provided via --hdri (specific file) or --hdri_root (presets directory).")
-
+    if not args.checkpoints or not args.hdri:
+        parser.error("--checkpoints and --hdri are required, either via CLI or a config file.")
+    # --- END NEW ---
+    
     # Compatibility structure
-    class _Args:
-        pass
+    class _Args: pass
     _a = _Args()
     _a.__dict__.update(vars(args))
     _a.pipeline = pipeline.extract(args)
     _a.sh_degree = args.sh_degree
 
     safe_state(getattr(args, "quiet", False))
-
+    
     app = RelightViewer(_a)
     app.run()
