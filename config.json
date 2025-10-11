@@ -1,5 +1,7 @@
 {
-  "checkpoint": "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap/chkpnt40000.pth",
+  "checkpoint": [
+    "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap/chkpnt40000.pth",
+    "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/owl_colmap_masked/chkpnt40000.pth"],
   "hdri_root": "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/",
   "m": "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap",
   "s": "/workspace/data/Datasets/ITRI_Relighting_Demo/backdoor_colmap",
