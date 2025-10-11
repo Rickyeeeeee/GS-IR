@@ -1,6 +1,6 @@
 {
   "checkpoints": {
-    "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap/chkpnt40000.pth": {
+    "backdoor_colmap": {
       "yaw": 0.0,
       "pitch": -68.9000015258789,
       "roll": 4.699999809265137,
@@ -21,7 +21,7 @@
         1000000.0
       ]
     },
-    "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/owl_colmap_masked/chkpnt40000.pth": {
+    "owl_colmap_masked": {
       "yaw": -28.200000762939453,
       "pitch": 45.29999923706055,
       "roll": 120.5,

@@ -91,6 +91,11 @@ class RelightViewer:
         if self.transform_state_path:
             self.transform_state_path = os.path.abspath(self.transform_state_path)
         self._transform_state_cache: Dict[str, Dict[str, object]] = {}
+        self.model_render_cache: List[Dict[str, object]] = [
+            {'attrs': None, 'dirty': True} for _ in self.models
+        ]
+        self.joint_render_cache: Dict[str, object] = {'attrs': None, 'dirty': True}
+        self.profile_timings: Dict[str, float] = {}
         self._load_transform_state()
 
         # Base Gaussian Rotation Fix (the original hardcoded R_fix)
@@ -181,7 +186,11 @@ class RelightViewer:
         gaussians.restore(model_params)
 
     def _state_key_for_checkpoint(self, ckpt_path: str) -> str:
-        return os.path.abspath(ckpt_path)
+        abs_path = os.path.abspath(ckpt_path)
+        scene_dir = os.path.basename(os.path.dirname(abs_path))
+        if not scene_dir:
+            scene_dir = os.path.splitext(os.path.basename(abs_path))[0]
+        return scene_dir
 
     def _load_transform_state(self):
         """Load saved transforms from disk and apply to current models."""
@@ -202,6 +211,9 @@ class RelightViewer:
         for idx, ckpt_path in enumerate(self.args.checkpoint):
             key = self._state_key_for_checkpoint(ckpt_path)
             saved = checkpoint_data.get(key)
+            if saved is None:
+                legacy_key = os.path.abspath(ckpt_path)
+                saved = checkpoint_data.get(legacy_key)
             if not isinstance(saved, dict):
                 continue
             trans = self.model_transforms[idx]
@@ -219,6 +231,7 @@ class RelightViewer:
             if isinstance(saved_bbox_max, (list, tuple)) and len(saved_bbox_max) == 3:
                 trans['bbox_max'] = [float(v) for v in saved_bbox_max]
             self._ensure_bbox_consistency(trans)
+            self._mark_model_dirty(idx)
 
     def _save_transform_state(self):
         """Persist the current per-model transforms to disk."""
@@ -271,7 +284,45 @@ class RelightViewer:
                 changed = True
         return changed
 
-    def _transform_model_attributes(self, model: GaussianModel, trans: Dict[str, object]) -> Dict[str, torch.Tensor]:
+    def _mark_model_dirty(self, idx: int):
+        if 0 <= idx < len(self.model_render_cache):
+            self.model_render_cache[idx]['dirty'] = True
+            self.model_render_cache[idx]['attrs'] = None
+        self.joint_render_cache['dirty'] = True
+        self.joint_render_cache['attrs'] = None
+
+    def _mark_all_models_dirty(self):
+        for cache in self.model_render_cache:
+            cache['dirty'] = True
+            cache['attrs'] = None
+        self.joint_render_cache['dirty'] = True
+        self.joint_render_cache['attrs'] = None
+
+    def _get_model_attrs(self, idx: int) -> Dict[str, torch.Tensor]:
+        cache = self.model_render_cache[idx]
+        if cache['dirty'] or cache['attrs'] is None:
+            cache['attrs'] = self._compute_model_attributes(self.models[idx], self.model_transforms[idx])
+            cache['dirty'] = False
+        return cache['attrs']
+
+    def _get_joint_attrs(self) -> Dict[str, torch.Tensor]:
+        cache = self.joint_render_cache
+        if cache['dirty'] or cache['attrs'] is None:
+            all_attrs: Dict[str, List[torch.Tensor]] = {
+                '_xyz': [], '_normal': [], '_rotation': [], '_features_dc': [],
+                '_features_rest': [], '_scaling': [], '_opacity': [], '_albedo': [],
+                '_roughness': [], '_metallic': []
+            }
+            for idx in range(len(self.models)):
+                attrs = self._get_model_attrs(idx)
+                for attr_name, tensor in attrs.items():
+                    all_attrs[attr_name].append(tensor)
+            joint_attrs = {attr_name: torch.cat(tensors, dim=0) for attr_name, tensors in all_attrs.items()}
+            cache['attrs'] = joint_attrs
+            cache['dirty'] = False
+        return cache['attrs']
+
+    def _compute_model_attributes(self, model: GaussianModel, trans: Dict[str, object]) -> Dict[str, torch.Tensor]:
         """Apply rotation, translation, scaling, and bounding box pruning to a model."""
         xyz = model.get_xyz
         device = xyz.device
@@ -332,31 +383,16 @@ class RelightViewer:
     def _use_individual_gaussian(self):
         """Applies the transform to the currently active model and sets it
         as the render target."""
-        active_model = self.models[self.active_model_idx]
-        trans = self.model_transforms[self.active_model_idx]
-        attrs = self._transform_model_attributes(active_model, trans)
+        attrs = self._get_model_attrs(self.active_model_idx)
         for attr_name, tensor in attrs.items():
             setattr(self.render_gaussians, attr_name, tensor)
 
     def _concatenate_gaussians(self):
         """Applies individual transforms and concatenates all models into a
         single GaussianModel for rendering."""
-        all_attrs = {
-            '_xyz': [], '_normal': [], '_rotation': [], '_features_dc': [],
-            '_features_rest': [], '_scaling': [], '_opacity': [], '_albedo': [],
-            '_roughness': [], '_metallic': []
-        }
-
-        for i, model in enumerate(self.models):
-            trans = self.model_transforms[i]
-
-            attrs = self._transform_model_attributes(model, trans)
-            for attr_name in all_attrs:
-                all_attrs[attr_name].append(attrs[attr_name])
-
-        # Concatenate all lists of tensors and assign to the render model
-        for attr_name, tensor_list in all_attrs.items():
-            setattr(self.render_gaussians, attr_name, torch.cat(tensor_list, dim=0))
+        joint_attrs = self._get_joint_attrs()
+        for attr_name, tensor in joint_attrs.items():
+            setattr(self.render_gaussians, attr_name, tensor)
 
     # -------------------------
     # Rendering
@@ -365,7 +401,9 @@ class RelightViewer:
     def render_current(self) -> torch.Tensor:
 
         # --- NEW: Prepare the gaussians based on the selected render mode ---
+        t_start = time.perf_counter()
         self._prepare_render_gaussians()
+        t_after_prepare = time.perf_counter()
 
         view = self.camera
 
@@ -374,6 +412,7 @@ class RelightViewer:
             viewpoint_camera=view, pc=self.render_gaussians, pipe=self.args.pipeline,
             bg_color=self.background, inference=True, pad_normal=True, derive_normal=True,
         )
+        t_after_render = time.perf_counter()
 
         normal_map = rendering_result["normal_map"]
         opacity_mask = rendering_result["opacity_map"]
@@ -416,6 +455,7 @@ class RelightViewer:
             brdf_lut=self.brdf_lut,
         )
         render_rgb = result["render_rgb"].clamp(0.0, 1.0)
+        t_after_shading = time.perf_counter()
 
         # Composite the HDRI as a background (uses ROTATED direction vector)
         if self.show_env_bg:
@@ -426,6 +466,16 @@ class RelightViewer:
                 env_rgb = _linear_to_srgb(env_rgb)
             bg_mask = 1.0 - opacity_mask.permute(1, 2, 0).clamp(0.0, 1.0)
             render_rgb = render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
+        t_after_env = time.perf_counter()
+
+        self.profile_timings = {
+            'prepare': (t_after_prepare - t_start) * 1000.0,
+            'render': (t_after_render - t_after_prepare) * 1000.0,
+            'shading': (t_after_shading - t_after_render) * 1000.0,
+            'composite': (t_after_env - t_after_shading) * 1000.0,
+            'total': (t_after_env - t_start) * 1000.0,
+            'gaussian_count': float(self.render_gaussians.get_xyz.shape[0]),
+        }
 
         return render_rgb.clamp(0.0, 1.0)
 
@@ -474,6 +524,26 @@ class RelightViewer:
                 if torch.cuda.is_available(): torch.cuda.synchronize(self.device)
                 img2 = self.render_current()
                 self._update_image(img2)
+                timings = self.profile_timings or {}
+                def _profile_or_default(tag: str, label: str):
+                    if dpg.does_item_exist(tag):
+                        value = timings.get(label)
+                        if value is None:
+                            if label == "gaussian_count":
+                                dpg.set_value(tag, "Gaussians: --")
+                            else:
+                                dpg.set_value(tag, f"{label.capitalize()}: -- ms")
+                        else:
+                            if label == "gaussian_count":
+                                dpg.set_value(tag, f"Gaussians: {int(value)}")
+                            else:
+                                dpg.set_value(tag, f"{label.capitalize()}: {value:.2f} ms")
+                _profile_or_default("profile_prepare", "prepare")
+                _profile_or_default("profile_render", "render")
+                _profile_or_default("profile_shading", "shading")
+                _profile_or_default("profile_composite", "composite")
+                _profile_or_default("profile_total", "total")
+                _profile_or_default("profile_gaussians", "gaussian_count")
             except Exception as e:
                 print(f"[viewer] Render error: {e}")
 
@@ -517,30 +587,37 @@ class RelightViewer:
 
         def on_model_yaw_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['yaw'] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_model_pitch_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['pitch'] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_model_roll_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['roll'] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_model_translation_x_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['translation'][0] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_model_translation_y_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['translation'][1] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_model_translation_z_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['translation'][2] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_model_scale_change(sender, app_data):
             self.model_transforms[self.active_model_idx]['scale'] = app_data
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         bbox_min_tags = ["bbox_min_x", "bbox_min_y", "bbox_min_z"]
@@ -554,6 +631,7 @@ class RelightViewer:
                 for ax in range(3):
                     dpg.set_value(bbox_min_tags[ax], trans['bbox_min'][ax])
                     dpg.set_value(bbox_max_tags[ax], trans['bbox_max'][ax])
+            self._mark_model_dirty(self.active_model_idx)
             render_callback()
 
         def on_bbox_min_x_change(sender, app_data): _update_bbox(0, True, app_data)
@@ -616,6 +694,15 @@ class RelightViewer:
             dpg.add_checkbox(label="ACES tone mapping", default_value=self.enable_tone, callback=on_toggle_tone)
             dpg.add_checkbox(label="Gamma correction (sRGB)", default_value=self.enable_gamma, callback=on_toggle_gamma)
             dpg.add_checkbox(label="HDRI as background", default_value=self.show_env_bg, callback=on_toggle_env)
+
+            dpg.add_separator()
+            dpg.add_text("Profiling")
+            dpg.add_text("Prepare: -- ms", tag="profile_prepare")
+            dpg.add_text("Render: -- ms", tag="profile_render")
+            dpg.add_text("Shading: -- ms", tag="profile_shading")
+            dpg.add_text("Composite: -- ms", tag="profile_composite")
+            dpg.add_text("Total: -- ms", tag="profile_total")
+            dpg.add_text("Gaussians: --", tag="profile_gaussians")
 
             dpg.add_separator()
             dpg.add_button(label="Render Once", callback=render_callback)
