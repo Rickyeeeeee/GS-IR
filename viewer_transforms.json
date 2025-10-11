@@ -1,0 +1,46 @@
+{
+  "checkpoints": {
+    "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap/chkpnt40000.pth": {
+      "yaw": 0.0,
+      "pitch": -68.9000015258789,
+      "roll": 4.699999809265137,
+      "translation": [
+        0.0,
+        -1.100000023841858,
+        0.0
+      ],
+      "scale": 5.0,
+      "bbox_min": [
+        -1000000.0,
+        -1000000.0,
+        -1000000.0
+      ],
+      "bbox_max": [
+        1000000.0,
+        1000000.0,
+        1000000.0
+      ]
+    },
+    "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/owl_colmap_masked/chkpnt40000.pth": {
+      "yaw": -28.200000762939453,
+      "pitch": 45.29999923706055,
+      "roll": 120.5,
+      "translation": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "scale": 0.9900000095367432,
+      "bbox_min": [
+        -2.5999999046325684,
+        -0.3199999928474426,
+        -2.5999999046325684
+      ],
+      "bbox_max": [
+        1.5,
+        2.9000000953674316,
+        2.0
+      ]
+    }
+  }
+}

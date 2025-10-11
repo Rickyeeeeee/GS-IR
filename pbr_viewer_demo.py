@@ -80,11 +80,18 @@ class RelightViewer:
                 'roll': 0.0,
                 'translation': [0.0, 0.0, 0.0],
                 'scale': 1.0,
+                'bbox_min': [-1e6, -1e6, -1e6],
+                'bbox_max': [1e6, 1e6, 1e6],
             }
             for _ in self.models
         ]
         self.active_model_idx = 0
         self.render_jointly = False # NEW: Flag for render mode
+        self.transform_state_path = getattr(args, "transform_state", None)
+        if self.transform_state_path:
+            self.transform_state_path = os.path.abspath(self.transform_state_path)
+        self._transform_state_cache: Dict[str, Dict[str, object]] = {}
+        self._load_transform_state()
 
         # Base Gaussian Rotation Fix (the original hardcoded R_fix)
         self.base_R_fix = torch.from_numpy(euler_to_matrix(
@@ -173,6 +180,147 @@ class RelightViewer:
         model_params = checkpoint.get("gaussians", checkpoint) if isinstance(checkpoint, Dict) else checkpoint[0]
         gaussians.restore(model_params)
 
+    def _state_key_for_checkpoint(self, ckpt_path: str) -> str:
+        return os.path.abspath(ckpt_path)
+
+    def _load_transform_state(self):
+        """Load saved transforms from disk and apply to current models."""
+        if not self.transform_state_path:
+            return
+        if not os.path.isfile(self.transform_state_path):
+            return
+        try:
+            with open(self.transform_state_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            print(f"[viewer] Failed to load transform state: {e}")
+            return
+
+        checkpoint_data = payload.get("checkpoints", {})
+        self._transform_state_cache = checkpoint_data
+
+        for idx, ckpt_path in enumerate(self.args.checkpoint):
+            key = self._state_key_for_checkpoint(ckpt_path)
+            saved = checkpoint_data.get(key)
+            if not isinstance(saved, dict):
+                continue
+            trans = self.model_transforms[idx]
+            trans['yaw'] = float(saved.get('yaw', trans['yaw']))
+            trans['pitch'] = float(saved.get('pitch', trans['pitch']))
+            trans['roll'] = float(saved.get('roll', trans['roll']))
+            saved_translation = saved.get('translation', trans['translation'])
+            if isinstance(saved_translation, (list, tuple)) and len(saved_translation) == 3:
+                trans['translation'] = [float(v) for v in saved_translation]
+            trans['scale'] = max(1e-6, float(saved.get('scale', trans['scale'])))
+            saved_bbox_min = saved.get('bbox_min')
+            if isinstance(saved_bbox_min, (list, tuple)) and len(saved_bbox_min) == 3:
+                trans['bbox_min'] = [float(v) for v in saved_bbox_min]
+            saved_bbox_max = saved.get('bbox_max')
+            if isinstance(saved_bbox_max, (list, tuple)) and len(saved_bbox_max) == 3:
+                trans['bbox_max'] = [float(v) for v in saved_bbox_max]
+            self._ensure_bbox_consistency(trans)
+
+    def _save_transform_state(self):
+        """Persist the current per-model transforms to disk."""
+        if not self.transform_state_path:
+            print("[viewer] Transform state path is not set; skipping save.")
+            return
+
+        directory = os.path.dirname(self.transform_state_path)
+        if directory and not os.path.isdir(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception as e:
+                print(f"[viewer] Failed to create directory for transform state: {e}")
+                return
+
+        checkpoint_data = {}
+        for idx, ckpt_path in enumerate(self.args.checkpoint):
+            key = self._state_key_for_checkpoint(ckpt_path)
+            trans = self.model_transforms[idx]
+            scale_value = max(1e-6, float(trans['scale']))
+            trans['scale'] = scale_value
+            trans['translation'] = [float(v) for v in trans['translation']]
+            self._ensure_bbox_consistency(trans)
+            trans['bbox_min'] = [float(v) for v in trans['bbox_min']]
+            trans['bbox_max'] = [float(v) for v in trans['bbox_max']]
+            checkpoint_data[key] = {
+                'yaw': float(trans['yaw']),
+                'pitch': float(trans['pitch']),
+                'roll': float(trans['roll']),
+                'translation': trans['translation'],
+                'scale': scale_value,
+                'bbox_min': trans['bbox_min'],
+                'bbox_max': trans['bbox_max'],
+            }
+
+        try:
+            with open(self.transform_state_path, "w", encoding="utf-8") as f:
+                json.dump({"checkpoints": checkpoint_data}, f, indent=2)
+            self._transform_state_cache = checkpoint_data
+            print(f"[viewer] Saved transforms to {self.transform_state_path}")
+        except Exception as e:
+            print(f"[viewer] Failed to save transform state: {e}")
+
+    def _ensure_bbox_consistency(self, trans: Dict[str, List[float]]) -> bool:
+        """Ensure bbox_min <= bbox_max per axis. Returns True if adjusted."""
+        changed = False
+        for axis in range(3):
+            if trans['bbox_min'][axis] > trans['bbox_max'][axis]:
+                trans['bbox_min'][axis], trans['bbox_max'][axis] = trans['bbox_max'][axis], trans['bbox_min'][axis]
+                changed = True
+        return changed
+
+    def _transform_model_attributes(self, model: GaussianModel, trans: Dict[str, object]) -> Dict[str, torch.Tensor]:
+        """Apply rotation, translation, scaling, and bounding box pruning to a model."""
+        xyz = model.get_xyz
+        device = xyz.device
+        dtype = xyz.dtype
+
+        self._ensure_bbox_consistency(trans)
+
+        yaw_rad = math.radians(trans['yaw'])
+        pitch_rad = math.radians(trans['pitch'])
+        roll_rad = math.radians(trans['roll'])
+
+        R_user = torch.from_numpy(euler_to_matrix(yaw_rad, pitch_rad, roll_rad)).to(device)
+        R_combined = R_user @ self.base_R_fix[:3, :3].to(device)
+
+        translation = torch.tensor(trans['translation'], device=device, dtype=dtype)
+        scale_factor = max(trans['scale'], 1e-6)
+        scale_tensor_xyz = torch.tensor(scale_factor, device=device, dtype=dtype)
+
+        rotated_xyz = (R_combined @ xyz.T).T * scale_tensor_xyz
+        transformed_xyz = rotated_xyz + translation
+
+        bbox_min = torch.tensor(trans['bbox_min'], device=device, dtype=dtype)
+        bbox_max = torch.tensor(trans['bbox_max'], device=device, dtype=dtype)
+        mask = ((transformed_xyz >= bbox_min) & (transformed_xyz <= bbox_max)).all(dim=1)
+
+        normals = (R_combined @ model.get_normal.T).T
+        base_rotations = build_rotation(model.get_rotation).to(device)
+        combined_rotations = torch.matmul(R_combined, base_rotations)
+        rotation_quat = rotation_to_quaternion(combined_rotations)
+
+        base_scaling = model.get_scaling
+        scaled_scaling = base_scaling * scale_tensor_xyz
+        raw_scaling = model.scaling_inverse_activation(scaled_scaling)
+
+        attrs = {
+            '_xyz': transformed_xyz[mask],
+            '_normal': normals[mask],
+            '_rotation': rotation_quat[mask],
+            '_features_dc': model._features_dc[mask],
+            '_features_rest': model._features_rest[mask],
+            '_scaling': raw_scaling[mask],
+            '_opacity': model._opacity[mask],
+            '_albedo': model._albedo[mask],
+            '_roughness': model._roughness[mask],
+            '_metallic': model._metallic[mask],
+        }
+
+        return attrs
+
     def _prepare_render_gaussians(self):
         """Prepares the self.render_gaussians object by either concatenating
         all models or just using the active one, based on the UI."""
@@ -186,36 +334,9 @@ class RelightViewer:
         as the render target."""
         active_model = self.models[self.active_model_idx]
         trans = self.model_transforms[self.active_model_idx]
-        R_user = torch.from_numpy(euler_to_matrix(
-            torch.deg2rad(torch.tensor(trans['yaw'])),
-            torch.deg2rad(torch.tensor(trans['pitch'])),
-            torch.deg2rad(torch.tensor(trans['roll'])))).cuda()
-        R_combined = R_user @ self.base_R_fix[:3, :3]
-
-        # Assign all attributes from the transformed active model
-        translation = torch.tensor(
-            trans['translation'],
-            device=active_model.get_xyz.device,
-            dtype=active_model.get_xyz.dtype,
-        )
-        scale_offset = torch.log(
-            torch.tensor(
-                max(trans['scale'], 1e-6),
-                device=active_model._scaling.device,
-                dtype=active_model._scaling.dtype,
-            )
-        )
-
-        self.render_gaussians._xyz = (R_combined @ active_model.get_xyz.T).T + translation
-        self.render_gaussians._normal = (R_combined @ active_model.get_normal.T).T
-        self.render_gaussians._rotation = rotation_to_quaternion(R_combined @ build_rotation(active_model.get_rotation))
-        self.render_gaussians._features_dc = active_model._features_dc
-        self.render_gaussians._features_rest = active_model._features_rest
-        self.render_gaussians._scaling = active_model._scaling + scale_offset
-        self.render_gaussians._opacity = active_model._opacity
-        self.render_gaussians._albedo = active_model._albedo
-        self.render_gaussians._roughness = active_model._roughness
-        self.render_gaussians._metallic = active_model._metallic
+        attrs = self._transform_model_attributes(active_model, trans)
+        for attr_name, tensor in attrs.items():
+            setattr(self.render_gaussians, attr_name, tensor)
 
     def _concatenate_gaussians(self):
         """Applies individual transforms and concatenates all models into a
@@ -229,41 +350,9 @@ class RelightViewer:
         for i, model in enumerate(self.models):
             trans = self.model_transforms[i]
 
-            # Calculate user-defined rotation for this model
-            R_user = torch.from_numpy(euler_to_matrix(
-                torch.deg2rad(torch.tensor(trans['yaw'])),
-                torch.deg2rad(torch.tensor(trans['pitch'])),
-                torch.deg2rad(torch.tensor(trans['roll'])))).cuda()
-
-            # Combine with the original fixed rotation
-            R_combined = R_user @ self.base_R_fix[:3, :3]
-
-            # Apply the combined rotation
-            translation = torch.tensor(
-                trans['translation'],
-                device=model.get_xyz.device,
-                dtype=model.get_xyz.dtype,
-            )
-            scale_offset = torch.log(
-                torch.tensor(
-                    max(trans['scale'], 1e-6),
-                    device=model._scaling.device,
-                    dtype=model._scaling.dtype,
-                )
-            )
-
-            all_attrs['_xyz'].append((R_combined @ model.get_xyz.T).T + translation)
-            all_attrs['_normal'].append((R_combined @ model.get_normal.T).T)
-            all_attrs['_rotation'].append(rotation_to_quaternion(R_combined @ build_rotation(model.get_rotation)))
-
-            # Append non-transformed attributes
-            all_attrs['_features_dc'].append(model._features_dc)
-            all_attrs['_features_rest'].append(model._features_rest)
-            all_attrs['_scaling'].append(model._scaling + scale_offset)
-            all_attrs['_opacity'].append(model._opacity)
-            all_attrs['_albedo'].append(model._albedo)
-            all_attrs['_roughness'].append(model._roughness)
-            all_attrs['_metallic'].append(model._metallic)
+            attrs = self._transform_model_attributes(model, trans)
+            for attr_name in all_attrs:
+                all_attrs[attr_name].append(attrs[attr_name])
 
         # Concatenate all lists of tensors and assign to the render model
         for attr_name, tensor_list in all_attrs.items():
@@ -418,6 +507,12 @@ class RelightViewer:
             dpg.set_value("model_translation_y", trans['translation'][1])
             dpg.set_value("model_translation_z", trans['translation'][2])
             dpg.set_value("model_scale", trans['scale'])
+            dpg.set_value("bbox_min_x", trans['bbox_min'][0])
+            dpg.set_value("bbox_min_y", trans['bbox_min'][1])
+            dpg.set_value("bbox_min_z", trans['bbox_min'][2])
+            dpg.set_value("bbox_max_x", trans['bbox_max'][0])
+            dpg.set_value("bbox_max_y", trans['bbox_max'][1])
+            dpg.set_value("bbox_max_z", trans['bbox_max'][2])
             render_callback()
 
         def on_model_yaw_change(sender, app_data):
@@ -448,6 +543,29 @@ class RelightViewer:
             self.model_transforms[self.active_model_idx]['scale'] = app_data
             render_callback()
 
+        bbox_min_tags = ["bbox_min_x", "bbox_min_y", "bbox_min_z"]
+        bbox_max_tags = ["bbox_max_x", "bbox_max_y", "bbox_max_z"]
+
+        def _update_bbox(axis: int, is_min: bool, value: float):
+            trans = self.model_transforms[self.active_model_idx]
+            key = 'bbox_min' if is_min else 'bbox_max'
+            trans[key][axis] = float(value)
+            if self._ensure_bbox_consistency(trans):
+                for ax in range(3):
+                    dpg.set_value(bbox_min_tags[ax], trans['bbox_min'][ax])
+                    dpg.set_value(bbox_max_tags[ax], trans['bbox_max'][ax])
+            render_callback()
+
+        def on_bbox_min_x_change(sender, app_data): _update_bbox(0, True, app_data)
+        def on_bbox_min_y_change(sender, app_data): _update_bbox(1, True, app_data)
+        def on_bbox_min_z_change(sender, app_data): _update_bbox(2, True, app_data)
+        def on_bbox_max_x_change(sender, app_data): _update_bbox(0, False, app_data)
+        def on_bbox_max_y_change(sender, app_data): _update_bbox(1, False, app_data)
+        def on_bbox_max_z_change(sender, app_data): _update_bbox(2, False, app_data)
+
+        def on_save_transforms(sender, app_data):
+            self._save_transform_state()
+
         def on_hdri_change(sender, app_data):
             self.hdri_label_current = app_data
             try:
@@ -457,6 +575,8 @@ class RelightViewer:
             render_callback()
 
         # --- Windows ---
+        current_transforms = self.model_transforms[self.active_model_idx]
+
         with dpg.window(label="Controls", width=380, height=-1, pos=(10, 10)):
             dpg.add_text("FPS: --", tag="fps_display")
             dpg.add_text("Frame Time: -- ms", tag="frametime_display")
@@ -470,13 +590,21 @@ class RelightViewer:
                 horizontal=True
             )
             dpg.add_combo(items=self.model_names, default_value=self.model_names[0], label="Active Model", callback=on_active_model_change)
-            dpg.add_slider_float(label="Model Yaw", tag="model_yaw", min_value=-180.0, max_value=180.0, default_value=0.0, format="%.1f deg", callback=on_model_yaw_change)
-            dpg.add_slider_float(label="Model Pitch", tag="model_pitch", min_value=-180.0, max_value=180.0, default_value=0.0, format="%.1f deg", callback=on_model_pitch_change)
-            dpg.add_slider_float(label="Model Roll", tag="model_roll", min_value=-180.0, max_value=180.0, default_value=0.0, format="%.1f deg", callback=on_model_roll_change)
-            dpg.add_drag_float(label="Translate X", tag="model_translation_x", speed=0.01, min_value=-10.0, max_value=10.0, default_value=0.0, format="%.3f", callback=on_model_translation_x_change)
-            dpg.add_drag_float(label="Translate Y", tag="model_translation_y", speed=0.01, min_value=-10.0, max_value=10.0, default_value=0.0, format="%.3f", callback=on_model_translation_y_change)
-            dpg.add_drag_float(label="Translate Z", tag="model_translation_z", speed=0.01, min_value=-10.0, max_value=10.0, default_value=0.0, format="%.3f", callback=on_model_translation_z_change)
-            dpg.add_slider_float(label="Model Scale", tag="model_scale", min_value=0.1, max_value=5.0, default_value=1.0, format="%.2f", callback=on_model_scale_change)
+            dpg.add_slider_float(label="Model Yaw", tag="model_yaw", min_value=-180.0, max_value=180.0, default_value=current_transforms['yaw'], format="%.1f deg", callback=on_model_yaw_change)
+            dpg.add_slider_float(label="Model Pitch", tag="model_pitch", min_value=-180.0, max_value=180.0, default_value=current_transforms['pitch'], format="%.1f deg", callback=on_model_pitch_change)
+            dpg.add_slider_float(label="Model Roll", tag="model_roll", min_value=-180.0, max_value=180.0, default_value=current_transforms['roll'], format="%.1f deg", callback=on_model_roll_change)
+            dpg.add_drag_float(label="Translate X", tag="model_translation_x", speed=0.01, min_value=-10.0, max_value=10.0, default_value=current_transforms['translation'][0], format="%.3f", callback=on_model_translation_x_change)
+            dpg.add_drag_float(label="Translate Y", tag="model_translation_y", speed=0.01, min_value=-10.0, max_value=10.0, default_value=current_transforms['translation'][1], format="%.3f", callback=on_model_translation_y_change)
+            dpg.add_drag_float(label="Translate Z", tag="model_translation_z", speed=0.01, min_value=-10.0, max_value=10.0, default_value=current_transforms['translation'][2], format="%.3f", callback=on_model_translation_z_change)
+            dpg.add_slider_float(label="Model Scale", tag="model_scale", min_value=0.1, max_value=5.0, default_value=current_transforms['scale'], format="%.2f", callback=on_model_scale_change)
+            dpg.add_separator()
+            dpg.add_text("Bounding Box (World)")
+            dpg.add_input_float(label="Min X", tag="bbox_min_x", default_value=current_transforms['bbox_min'][0], format="%.3f", step=0.0, callback=on_bbox_min_x_change)
+            dpg.add_input_float(label="Min Y", tag="bbox_min_y", default_value=current_transforms['bbox_min'][1], format="%.3f", step=0.0, callback=on_bbox_min_y_change)
+            dpg.add_input_float(label="Min Z", tag="bbox_min_z", default_value=current_transforms['bbox_min'][2], format="%.3f", step=0.0, callback=on_bbox_min_z_change)
+            dpg.add_input_float(label="Max X", tag="bbox_max_x", default_value=current_transforms['bbox_max'][0], format="%.3f", step=0.0, callback=on_bbox_max_x_change)
+            dpg.add_input_float(label="Max Y", tag="bbox_max_y", default_value=current_transforms['bbox_max'][1], format="%.3f", step=0.0, callback=on_bbox_max_y_change)
+            dpg.add_input_float(label="Max Z", tag="bbox_max_z", default_value=current_transforms['bbox_max'][2], format="%.3f", step=0.0, callback=on_bbox_max_z_change)
 
             dpg.add_separator()
             dpg.add_text("Environment")
@@ -491,6 +619,9 @@ class RelightViewer:
 
             dpg.add_separator()
             dpg.add_button(label="Render Once", callback=render_callback)
+            dpg.add_button(label="Save Transforms", callback=on_save_transforms)
+            if self.transform_state_path:
+                dpg.add_text(f"Transforms file: {self.transform_state_path}", wrap=360)
 
             dpg.add_separator()
             checkpoints_str = "\n".join(self.args.checkpoint)
@@ -571,6 +702,7 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", action="store_true", help="Enable linear->sRGB gamma correction.")
     parser.add_argument("--metallic", action="store_true", help="Use reconstructed metallic map.")
     parser.add_argument("--no_env_bg", action="store_true", help="Disable compositing HDRI as background.")
+    parser.add_argument("--transform_state", type=str, default="viewer_transforms.json", help="Path to store/load per-model transform adjustments.")
 
     # Temporarily parse for config path
     temp_args, _ = parser.parse_known_args()
