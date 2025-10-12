@@ -3,7 +3,7 @@
 
 
 ## Installation
-(Install conda, only tested on Ubuntu).
+(Install conda, only tested on Ubuntu 22.04 with cuda 11.8 ).
 First clone the repository, than create the basic environment
 ```sh
 conda env create --file environment.yml
