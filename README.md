@@ -3,6 +3,7 @@
 
 
 ## Installation
+(Install conda, only tested on Ubuntu).
 First clone the repository, than create the basic environment
 ```sh
 conda env create --file environment.yml
@@ -22,6 +23,36 @@ pip install ./nvdiffrast
 pip install ./simple-knn
 pip install ./diff-gaussian-rasterization # or cd ./diff-gaussian-rasterization && python setup.py develop && cd ../..
 pip install dearpygui
+```
+
+## Demo
+### 1. Download dataset and pretrained models
+Download contenets for the link: https://gofile.me/7fCAL/XSDwayhMN (password: cgvlab)
+- Dowload everything from the `Demo/` folder.
+### 2. Installation
+Run the above installation.
+### 3. Run the viewer
+- Modify the paths of `config.json`:
+```json
+{
+  "checkpoint": [
+    "${Your folder}Demo/outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap/chkpnt40000.pth",
+    "${Your folder}Demo/outputs/ITRI_Relighting_Demo/gsir/owl_colmap_masked/chkpnt40000.pth"],
+  "hdri_root": "{Your folder}/Demo/EnvironmentMaps/high_res_envmaps_1k/",
+  "m": "",
+  "s": "",
+  "width": 1200,
+  "height": 900,
+  "tone": true,
+  "gamma": true,
+  "metallic": true,
+  "eval": true
+}
+
+```
+- Run the following command:
+```bash
+python pbr_viewer_demo.py --config config.json
 ```
 
 ## Dataset
