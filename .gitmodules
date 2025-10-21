@@ -1,0 +1,3 @@
+[submodule "submodules/pycuda"]
+	path = submodules/pycuda
+	url = https://github.com/inducer/pycuda.git
