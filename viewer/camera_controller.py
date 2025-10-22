@@ -50,7 +50,7 @@ class CameraController:
         }
         self._key_state = {name: False for name in self._key_cache}
 
-        mouse_button = imgui_mouse_button("Left")
+        mouse_button = imgui_mouse_button("Middle")
         self._mouse_button = int(mouse_button) if mouse_button is not None else 0
         self._mouse_dragging = False
 

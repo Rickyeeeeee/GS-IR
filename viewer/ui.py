@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from imgui_bundle import imgui
+from imgui_bundle import imgui, imguizmo
 
 from .imgui_utils import imgui_cond, imgui_hovered_flag
 from .state import ViewerState
@@ -18,6 +18,19 @@ class ViewerUI:
         self.render_window_focused = False
         self.render_image_hovered = False
         self.render_image_active = False
+        self._gizmo = imguizmo.im_guizmo
+        self._gizmo_object_matrix = np.array(
+            [
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            dtype=np.float32,
+        )
+        self._gizmo_identity = np.eye(4, dtype=np.float32)
+        self._gizmo_operation = self._gizmo.OPERATION.translate
+        self._gizmo_mode = self._gizmo.MODE.local
 
     # --------------------------------------------------------------------- windows --
     def draw_control_window(self, last_frame_dt: float, viewer_timings: dict[str, float]) -> None:
@@ -167,6 +180,7 @@ class ViewerUI:
                         imgui.dummy((0.0, float(avail_h - display_h)))
                     self.render_image_hovered = bool(imgui.is_item_hovered())
                     self.render_image_active = bool(imgui.is_item_active())
+                    self._draw_gizmo_widget()
                     imgui.text(
                         f"Displayed {render_w} x {render_h} (scale {self.renderer.resolution_scale:.2f})"
                     )
@@ -190,6 +204,44 @@ class ViewerUI:
         imgui.end()
 
     # ----------------------------------------------------------------- sub-widgets --
+    def _draw_gizmo_widget(self) -> None:
+        gizmo = self._gizmo
+        gizmo.begin_frame()
+        gizmo.set_orthographic(False)
+        window_pos = imgui.get_window_pos()
+        content_min = imgui.get_window_content_region_min()
+        content_max = imgui.get_window_content_region_max()
+        rect_x = window_pos.x + content_min.x
+        rect_y = window_pos.y + content_min.y
+        rect_w = content_max.x - content_min.x
+        rect_h = content_max.y - content_min.y
+        gizmo.set_drawlist()
+        gizmo.set_rect(rect_x, rect_y, rect_w, rect_h)
+
+        camera = self.state.camera
+        corrected_world_view_transform = camera.world_view_transform.clone()
+        corrected_world_view_transform[:,1] *= -1
+        camera_view = np.ascontiguousarray(corrected_world_view_transform.cpu().numpy(), dtype=np.float32)
+        camera_projection = np.ascontiguousarray(camera.projection_matrix.cpu().numpy(), dtype=np.float32)
+        object_matrix = np.ascontiguousarray(self._gizmo_object_matrix, dtype=np.float32)
+
+        gizmo.draw_grid(camera_view, camera_projection, self._gizmo_identity, 10.0)
+        gizmo.draw_cubes(camera_view, camera_projection, [object_matrix])
+
+        manip_result = gizmo.manipulate(
+            camera_view,
+            camera_projection,
+            self._gizmo_operation,
+            self._gizmo_mode,
+            object_matrix,
+            None,
+            None,
+            None,
+            None,
+        )
+        if manip_result:
+            self._gizmo_object_matrix = np.ascontiguousarray(manip_result.value.astype(np.float32))
+
     def _draw_transform_controls(self) -> None:
         trans = self.state.model_transforms[self.state.active_model_idx]
 
