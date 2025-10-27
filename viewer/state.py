@@ -265,7 +265,7 @@ class ViewerState:
 
         bbox_min = torch.tensor(trans["bbox_min"], device=device, dtype=dtype)
         bbox_max = torch.tensor(trans["bbox_max"], device=device, dtype=dtype)
-        mask = ((transformed_xyz >= bbox_min) & (transformed_xyz <= bbox_max)).all(dim=1)
+        mask = ((xyz >= bbox_min) & (xyz <= bbox_max)).all(dim=1)
 
         normals = (R_combined @ model.get_normal.T).T
         base_rotations = build_rotation(model.get_rotation).to(device)

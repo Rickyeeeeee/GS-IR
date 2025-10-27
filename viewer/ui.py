@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from imgui_bundle import imgui, imguizmo
 
 from .imgui_utils import imgui_cond, imgui_hovered_flag
 from .state import ViewerState
 from .renderer import ViewerRenderer
+from utils.viewer_utils import euler_to_matrix
 
 
 class ViewerUI:
@@ -19,18 +22,16 @@ class ViewerUI:
         self.render_image_hovered = False
         self.render_image_active = False
         self._gizmo = imguizmo.im_guizmo
-        self._gizmo_object_matrix = np.array(
-            [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
-            ],
-            dtype=np.float32,
-        )
         self._gizmo_identity = np.eye(4, dtype=np.float32)
         self._gizmo_operation = self._gizmo.OPERATION.translate
         self._gizmo_mode = self._gizmo.MODE.local
+        base_rotation = (
+            self.state.base_R_fix[:3, :3].detach().cpu().numpy().astype(np.float32)
+            if hasattr(self.state, "base_R_fix")
+            else np.eye(3, dtype=np.float32)
+        )
+        self._gizmo_base_rotation = base_rotation
+        self._gizmo_base_rotation_inv = base_rotation.T
 
     # --------------------------------------------------------------------- windows --
     def draw_control_window(self, last_frame_dt: float, viewer_timings: dict[str, float]) -> None:
@@ -181,9 +182,6 @@ class ViewerUI:
                     self.render_image_hovered = bool(imgui.is_item_hovered())
                     self.render_image_active = bool(imgui.is_item_active())
                     self._draw_gizmo_widget()
-                    imgui.text(
-                        f"Displayed {render_w} x {render_h} (scale {self.renderer.resolution_scale:.2f})"
-                    )
                 else:
                     imgui.text("Texture unavailable; ensure an OpenGL context is active.")
                     self.render_image_hovered = False
@@ -220,14 +218,13 @@ class ViewerUI:
 
         camera = self.state.camera
         corrected_world_view_transform = camera.world_view_transform.clone()
-        corrected_world_view_transform[:,1] *= -1
+        corrected_world_view_transform[:, 1] *= -1
         camera_view = np.ascontiguousarray(corrected_world_view_transform.cpu().numpy(), dtype=np.float32)
         camera_projection = np.ascontiguousarray(camera.projection_matrix.cpu().numpy(), dtype=np.float32)
-        object_matrix = np.ascontiguousarray(self._gizmo_object_matrix, dtype=np.float32)
+        object_matrix = self._build_active_object_matrix()
 
         gizmo.draw_grid(camera_view, camera_projection, self._gizmo_identity, 10.0)
         gizmo.draw_cubes(camera_view, camera_projection, [object_matrix])
-
         manip_result = gizmo.manipulate(
             camera_view,
             camera_projection,
@@ -240,7 +237,84 @@ class ViewerUI:
             None,
         )
         if manip_result:
-            self._gizmo_object_matrix = np.ascontiguousarray(manip_result.value.astype(np.float32))
+            result_matrix = np.asarray(manip_result.value, dtype=np.float32)
+            self._apply_gizmo_transform(np.ascontiguousarray(result_matrix.T))
+
+    def _build_active_object_matrix(self) -> np.ndarray:
+        trans = self.state.model_transforms[self.state.active_model_idx]
+        yaw = math.radians(float(trans["yaw"]))
+        pitch = math.radians(float(trans["pitch"]))
+        roll = math.radians(float(trans["roll"]))
+        rotation_user = euler_to_matrix(yaw, pitch, roll).astype(np.float32)
+        rotation_combined = rotation_user @ self._gizmo_base_rotation
+        scale = float(trans["scale"])
+        translation = np.array(trans["translation"], dtype=np.float32)
+
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, :3] = rotation_combined * scale
+        matrix[:3, 3] = translation
+        return np.ascontiguousarray(matrix.T)
+
+    def _apply_gizmo_transform(self, matrix: np.ndarray) -> None:
+        scale = float(np.linalg.norm(matrix[:3, 0]))
+        rotation_combined = matrix[:3, :3] / scale
+        rotation_user = rotation_combined @ self._gizmo_base_rotation_inv
+        yaw, pitch, roll = self._rotation_matrix_to_euler(rotation_user)
+        translation = matrix[:3, 3]
+
+        trans = self.state.model_transforms[self.state.active_model_idx]
+        trans["translation"] = translation.astype(np.float32).tolist()
+        trans["scale"] = scale
+        trans["yaw"] = math.degrees(yaw)
+        trans["pitch"] = math.degrees(pitch)
+        trans["roll"] = math.degrees(roll)
+        self.state.mark_model_dirty(self.state.active_model_idx)
+
+    def _rotation_matrix_to_euler(self, rotation: np.ndarray) -> tuple[float, float, float]:
+        trace = rotation[0, 0] + rotation[1, 1] + rotation[2, 2]
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (rotation[2, 1] - rotation[1, 2]) / s
+            qy = (rotation[0, 2] - rotation[2, 0]) / s
+            qz = (rotation[1, 0] - rotation[0, 1]) / s
+        elif rotation[0, 0] > rotation[1, 1] and rotation[0, 0] > rotation[2, 2]:
+            s = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+            qw = (rotation[2, 1] - rotation[1, 2]) / s
+            qx = 0.25 * s
+            qy = (rotation[0, 1] + rotation[1, 0]) / s
+            qz = (rotation[0, 2] + rotation[2, 0]) / s
+        elif rotation[1, 1] > rotation[2, 2]:
+            s = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+            qw = (rotation[0, 2] - rotation[2, 0]) / s
+            qx = (rotation[0, 1] + rotation[1, 0]) / s
+            qy = 0.25 * s
+            qz = (rotation[1, 2] + rotation[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+            qw = (rotation[1, 0] - rotation[0, 1]) / s
+            qx = (rotation[0, 2] + rotation[2, 0]) / s
+            qy = (rotation[1, 2] + rotation[2, 1]) / s
+            qz = 0.25 * s
+
+        sinr_cosp = 2.0 * (qw * qx + qy * qz)
+        cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+        roll_x = math.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1.0:
+            pitch_y = math.copysign(math.pi / 2.0, sinp)
+        else:
+            pitch_y = math.asin(sinp)
+
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        yaw_z = math.atan2(siny_cosp, cosy_cosp)
+
+        pitch = roll_x
+        yaw = pitch_y
+        roll = yaw_z
+        return yaw, pitch, roll
 
     def _draw_transform_controls(self) -> None:
         trans = self.state.model_transforms[self.state.active_model_idx]
@@ -251,6 +325,16 @@ class ViewerUI:
                 trans[field] = value
                 self.state.mark_model_dirty(self.state.active_model_idx)
                 self.log(f"{label} set to {value:.3f}")
+
+        imgui.text("Gizmo Operation")
+        if imgui.radio_button("Translate", self._gizmo_operation == self._gizmo.OPERATION.translate):
+            self._gizmo_operation = self._gizmo.OPERATION.translate
+        imgui.same_line()
+        if imgui.radio_button("Rotate", self._gizmo_operation == self._gizmo.OPERATION.rotate):
+            self._gizmo_operation = self._gizmo.OPERATION.rotate
+        imgui.same_line()
+        if imgui.radio_button("Scale", self._gizmo_operation == self._gizmo.OPERATION.scale):
+            self._gizmo_operation = self._gizmo.OPERATION.scale
 
         imgui.text("Model Orientation")
         slider("Yaw (deg)", "yaw", -180.0, 180.0)
