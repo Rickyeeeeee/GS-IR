@@ -195,8 +195,6 @@ def pbr_shading(
     results.update(
         {
             "render_rgb": render_rgb,
-            "diffuse_rgb": diffuse_rgb.squeeze(),
-            "specular_rgb": specular_rgb.squeeze(),
         }
     )
 

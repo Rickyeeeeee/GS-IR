@@ -33,63 +33,66 @@ class ViewerRenderer:
         t_start = time.perf_counter()
         gaussians = state.prepare_render_gaussians()
         t_after_prepare = time.perf_counter()
+        
+        with torch.no_grad():
 
-        view = state.camera
-        rendering_result = render(
-            viewpoint_camera=view,
-            pc=gaussians,
-            pipe=state.args.pipeline,
-            bg_color=state.background,
-            inference=True,
-            pad_normal=True,
-            derive_normal=True,
-        )
-        t_after_render = time.perf_counter()
+            view = state.camera
+            rendering_result = render(
+                viewpoint_camera=view,
+                pc=gaussians,
+                pipe=state.args.pipeline,
+                bg_color=state.background,
+                inference=True,
+                pad_normal=True,
+                derive_normal=True,
+            )
+            t_after_render = time.perf_counter()
 
-        normal_map = rendering_result["normal_map"]
-        opacity_mask = rendering_result["opacity_map"]
-        albedo_map = rendering_result["albedo_map"]
-        roughness_map = rendering_result["roughness_map"]
-        metallic_map = rendering_result["metallic_map"]
+            normal_map = rendering_result["normal_map"]
+            opacity_mask = rendering_result["opacity_map"]
+            albedo_map = rendering_result["albedo_map"]
+            roughness_map = rendering_result["roughness_map"]
+            metallic_map = rendering_result["metallic_map"]
 
-        H, W = view.image_height, view.image_width
-        c2w = torch.inverse(view.world_view_transform.T)
-        canonical_rays = get_canonical_rays(H, W, view.FoVx, view.FoVy)
-        view_dirs = -(
-            (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3]).sum(dim=-1).reshape(H, W, 3)
-        )
+            H, W = view.image_height, view.image_width
+            c2w = torch.inverse(view.world_view_transform.T)
+            canonical_rays = get_canonical_rays(H, W, view.FoVx, view.FoVy)
+            view_dirs = -(
+                (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3]).sum(dim=-1).reshape(H, W, 3)
+            )
 
-        env_yaw_rad = torch.tensor(state.hdri_rotation_deg * (torch.pi / 180.0), device=view_dirs.device)
-        env_cos_yaw = torch.cos(env_yaw_rad)
-        env_sin_yaw = torch.sin(env_yaw_rad)
-        x, y, z = view_dirs[..., 0], view_dirs[..., 1], view_dirs[..., 2]
-        x_rotated = x * env_cos_yaw - z * env_sin_yaw
-        z_rotated = x * env_sin_yaw + z * env_cos_yaw
-        light_sample_dirs = torch.stack([x_rotated, y, z_rotated], dim=-1)
+            env_yaw_rad = torch.tensor(state.hdri_rotation_deg * (torch.pi / 180.0), device=view_dirs.device)
+            env_cos_yaw = torch.cos(env_yaw_rad)
+            env_sin_yaw = torch.sin(env_yaw_rad)
+            x, y, z = view_dirs[..., 0], view_dirs[..., 1], view_dirs[..., 2]
+            x_rotated = x * env_cos_yaw - z * env_sin_yaw
+            z_rotated = x * env_sin_yaw + z * env_cos_yaw
+            light_sample_dirs = torch.stack([x_rotated, y, z_rotated], dim=-1)
 
-        result = pbr_shading(
-            light=state.light,
-            normals=normal_map.permute(1, 2, 0),
-            view_dirs=light_sample_dirs,
-            mask=rendering_result["normal_mask"].permute(1, 2, 0),
-            albedo=albedo_map.permute(1, 2, 0),
-            roughness=roughness_map.permute(1, 2, 0),
-            metallic=metallic_map.permute(1, 2, 0) if state.enable_metallic else None,
-            tone=state.enable_tone,
-            gamma=state.enable_gamma,
-            brdf_lut=state.brdf_lut,
-        )
-        render_rgb = result["render_rgb"].clamp(0.0, 1.0)
-        t_after_shading = time.perf_counter()
+            result = pbr_shading(
+                light=state.light,
+                normals=normal_map.permute(1, 2, 0),
+                view_dirs=light_sample_dirs,
+                mask=rendering_result["normal_mask"].permute(1, 2, 0),
+                albedo=albedo_map.permute(1, 2, 0),
+                roughness=roughness_map.permute(1, 2, 0),
+                metallic=metallic_map.permute(1, 2, 0) if state.enable_metallic else None,
+                tone=state.enable_tone,
+                gamma=state.enable_gamma,
+                brdf_lut=state.brdf_lut,
+            )
 
-        composed_rgb = state.composite_render(
-            render_rgb,
-            opacity_mask,
-            light_sample_dirs,
-            state.enable_tone,
-            state.enable_gamma,
-        )
-        t_after_env = time.perf_counter()
+            render_rgb = result["render_rgb"].clamp(0.0, 1.0)
+            t_after_shading = time.perf_counter()
+
+            composed_rgb = state.composite_render(
+                render_rgb,
+                opacity_mask,
+                light_sample_dirs,
+                state.enable_tone,
+                state.enable_gamma,
+            )
+            t_after_env = time.perf_counter()
 
         state.profile_timings = {
             "prepare": (t_after_prepare - t_start) * 1000.0,

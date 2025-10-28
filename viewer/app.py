@@ -97,6 +97,5 @@ class RelightViewer:
 
         immapp.run(runner_params)
 
-
 def run_viewer(args) -> None:
     RelightViewer(args).run()
