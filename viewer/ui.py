@@ -221,10 +221,9 @@ class ViewerUI:
         corrected_world_view_transform[:, 1] *= -1
         camera_view = np.ascontiguousarray(corrected_world_view_transform.cpu().numpy(), dtype=np.float32)
         camera_projection = np.ascontiguousarray(camera.projection_matrix.cpu().numpy(), dtype=np.float32)
-        object_matrix = self._build_active_object_matrix()
+        object_matrix = self._build_gizmo_matrix()
 
         gizmo.draw_grid(camera_view, camera_projection, self._gizmo_identity, 10.0)
-        gizmo.draw_cubes(camera_view, camera_projection, [object_matrix])
         manip_result = gizmo.manipulate(
             camera_view,
             camera_projection,
@@ -240,7 +239,7 @@ class ViewerUI:
             result_matrix = np.asarray(manip_result.value, dtype=np.float32)
             self._apply_gizmo_transform(np.ascontiguousarray(result_matrix.T))
 
-    def _build_active_object_matrix(self) -> np.ndarray:
+    def _build_gizmo_matrix(self) -> np.ndarray:
         trans = self.state.model_transforms[self.state.active_model_idx]
         yaw = math.radians(float(trans["yaw"]))
         pitch = math.radians(float(trans["pitch"]))
@@ -257,6 +256,7 @@ class ViewerUI:
 
     def _apply_gizmo_transform(self, matrix: np.ndarray) -> None:
         scale = float(np.linalg.norm(matrix[:3, 0]))
+        scale = max(scale, 1e-6)
         rotation_combined = matrix[:3, :3] / scale
         rotation_user = rotation_combined @ self._gizmo_base_rotation_inv
         yaw, pitch, roll = self._rotation_matrix_to_euler(rotation_user)
@@ -364,12 +364,22 @@ class ViewerUI:
             self.state.ensure_bbox_consistency(trans)
             self.state.mark_model_dirty(self.state.active_model_idx)
             self.log("BBox Min updated")
+
         changed_max, bbox_max = imgui.drag_float3("BBox Max", trans["bbox_max"], v_speed=0.01, format="%.3f")
         if changed_max:
             trans["bbox_max"] = [float(v) for v in bbox_max]
             self.state.ensure_bbox_consistency(trans)
             self.state.mark_model_dirty(self.state.active_model_idx)
             self.log("BBox Max updated")
+
+        imgui.text("BBox Orientation")
+        for label, key in (("BBox Yaw", "bbox_yaw"), ("BBox Pitch", "bbox_pitch"), ("BBox Roll", "bbox_roll")):
+            current = float(trans.get(key, 0.0))
+            changed_angle, value_angle = imgui.slider_float(label, current, -180.0, 180.0)
+            if changed_angle:
+                trans[key] = float(value_angle)
+                self.state.mark_model_dirty(self.state.active_model_idx)
+                self.log(f"{label} updated to {value_angle:.2f}")
 
     def _draw_environment_controls(self) -> None:
         imgui.text("Environment")

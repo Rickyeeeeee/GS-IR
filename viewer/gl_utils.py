@@ -208,7 +208,6 @@ class CudaTexture2D(OpenGLTexture2D):
             print(f"!!! OpenGL error existed BEFORE this function: {existing_error}")
         self._ensure_interop()
         internal_format, pixel_format, pixel_type = _infer_formats_from_tensor(tensor)
-        print(internal_format, pixel_format, pixel_type)
         height, width, _ = tensor.shape
 
         if self.texture_id is None:

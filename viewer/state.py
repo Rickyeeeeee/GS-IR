@@ -27,15 +27,15 @@ from viewer_camera import ViewerCamera
 HDRI_PRESETS: List[Tuple[str, str]] = [
     ("Bridge", "bridge.hdr"),
     ("City", "city.hdr"),
-    ("Courtyard", "courtyard.hdr"),
+    # ("Courtyard", "courtyard.hdr"),
     ("Fireplace", "fireplace.hdr"),
     ("Forest", "forest.hdr"),
     ("Interior", "interior.hdr"),
-    ("Museum", "museum.hdr"),
+    # ("Museum", "museum.hdr"),
     ("Night", "night.hdr"),
     ("Snow", "snow.hdr"),
     ("Square", "square.hdr"),
-    ("Studio", "studio.hdr"),
+    # ("Studio", "studio.hdr"),
     ("Sunrise", "sunrise.hdr"),
     ("Sunset", "sunset.hdr"),
     ("Tunnel", "tunnel.hdr"),
@@ -51,6 +51,9 @@ class TransformState:
     scale: float = 1.0
     bbox_min: List[float] = field(default_factory=lambda: [-1e6, -1e6, -1e6])
     bbox_max: List[float] = field(default_factory=lambda: [1e6, 1e6, 1e6])
+    bbox_yaw: float = 0.0
+    bbox_pitch: float = 0.0
+    bbox_roll: float = 0.0
 
 
 class ViewerState:
@@ -198,6 +201,9 @@ class ViewerState:
             bbox_max = saved.get("bbox_max")
             if isinstance(bbox_max, (list, tuple)) and len(bbox_max) == 3:
                 trans["bbox_max"] = [float(v) for v in bbox_max]
+            trans["bbox_yaw"] = float(saved.get("bbox_yaw", trans["bbox_yaw"]))
+            trans["bbox_pitch"] = float(saved.get("bbox_pitch", trans["bbox_pitch"]))
+            trans["bbox_roll"] = float(saved.get("bbox_roll", trans["bbox_roll"]))
 
     def save_transform_state(self) -> None:
         checkpoint_data = {}
@@ -211,12 +217,14 @@ class ViewerState:
                 "scale": float(trans["scale"]),
                 "bbox_min": [float(v) for v in trans["bbox_min"]],
                 "bbox_max": [float(v) for v in trans["bbox_max"]],
+                "bbox_yaw": float(trans.get("bbox_yaw", 0.0)),
+                "bbox_pitch": float(trans.get("bbox_pitch", 0.0)),
+                "bbox_roll": float(trans.get("bbox_roll", 0.0)),
             }
 
         with open(self.transform_state_path, "w", encoding="utf-8") as handle:
             json.dump({"checkpoints": checkpoint_data}, handle, indent=2)
-        self._transform_state_cache = checkpoint
-        self.mode_data
+        self._transform_state_cache = checkpoint_data
         print(f"[viewer] Saved transforms to {self.transform_state_path}")
 
     def ensure_bbox_consistency(self, trans: Dict[str, List[float]]) -> None:
@@ -265,7 +273,14 @@ class ViewerState:
 
         bbox_min = torch.tensor(trans["bbox_min"], device=device, dtype=dtype)
         bbox_max = torch.tensor(trans["bbox_max"], device=device, dtype=dtype)
-        mask = ((xyz >= bbox_min) & (xyz <= bbox_max)).all(dim=1)
+        bbox_yaw = math.radians(float(trans.get("bbox_yaw", 0.0)))
+        bbox_pitch = math.radians(float(trans.get("bbox_pitch", 0.0)))
+        bbox_roll = math.radians(float(trans.get("bbox_roll", 0.0)))
+        bbox_rotation = torch.from_numpy(
+            euler_to_matrix(bbox_yaw, bbox_pitch, bbox_roll)
+        ).to(device=device, dtype=dtype)
+        local_points = torch.matmul(xyz, bbox_rotation.t())
+        mask = ((local_points >= bbox_min) & (local_points <= bbox_max)).all(dim=1)
 
         normals = (R_combined @ model.get_normal.T).T
         base_rotations = build_rotation(model.get_rotation).to(device)
