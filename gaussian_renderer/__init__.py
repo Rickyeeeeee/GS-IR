@@ -31,6 +31,7 @@ def render(
     inference: bool = False,
     pad_normal: bool = False,
     derive_normal: bool = False,
+    argmax_depth: bool = False,
 ) -> Dict:
     """
     Render the scene.
@@ -65,7 +66,7 @@ def render(
         prefiltered=False,
         debug=pipe.debug,
         inference=inference,
-        argmax_depth=False,
+        argmax_depth=argmax_depth,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)

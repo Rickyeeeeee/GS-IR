@@ -144,6 +144,7 @@ def training(
     tb_writer = prepare_output_and_logger(dataset)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    print(bg_color)
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing=True)

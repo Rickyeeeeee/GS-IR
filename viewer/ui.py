@@ -416,3 +416,53 @@ class ViewerUI:
         if changed:
             self.state.show_env_bg = env_bg_state
             self.log(f"HDRI background {'enabled' if env_bg_state else 'disabled'}")
+
+        imgui.separator()
+        imgui.text("Point Light")
+        point = self.state.point_light
+        changed_light, enabled = imgui.checkbox("Enable Point Light", point.enabled)
+        if changed_light:
+            point.enabled = enabled
+            self.log(f"Point light {'enabled' if enabled else 'disabled'}")
+
+        if point.enabled:
+            changed_pos, new_pos = imgui.drag_float3(
+                "Position", point.position, v_speed=0.01, format="%.3f"
+            )
+            if changed_pos:
+                point.position = [float(v) for v in new_pos]
+                self.state.mark_point_light_dirty()
+                self.log(f"Point light position set to {point.position}")
+
+            changed_intensity, new_intensity = imgui.drag_float3(
+                "Intensity", point.intensity, v_speed=1.0, format="%.2f"
+            )
+            if changed_intensity:
+                point.intensity = [max(0.0, float(v)) for v in new_intensity]
+                self.log("Point light intensity updated")
+
+            changed_shadow, shadow_state = imgui.checkbox("Cast Shadows", point.enable_shadow)
+            if changed_shadow:
+                point.enable_shadow = shadow_state
+                self.state.mark_point_light_dirty()
+                self.log(f"Point light shadows {'enabled' if shadow_state else 'disabled'}")
+
+            if point.enable_shadow:
+                shadow_res_options = [128, 256, 512, 1024, 2048]
+                if point.shadow_resolution not in shadow_res_options:
+                    shadow_res_options.append(point.shadow_resolution)
+                    shadow_res_options.sort()
+                current_idx = shadow_res_options.index(point.shadow_resolution)
+                labels = [f"{res}" for res in shadow_res_options]
+                changed_res, new_idx = imgui.combo("Shadow Resolution", current_idx, labels)
+                if changed_res and 0 <= new_idx < len(shadow_res_options):
+                    point.shadow_resolution = int(shadow_res_options[new_idx])
+                    self.state.mark_point_light_dirty()
+                    self.log(f"Point light shadow resolution set to {point.shadow_resolution}")
+
+                changed_bias, new_bias = imgui.drag_float(
+                    "Shadow Threshold", point.shadow_bias, v_speed=0.001, v_min=0.0, v_max=1.0, format="%.4f"
+                )
+                if changed_bias:
+                    point.shadow_bias = float(max(0.0, min(1.0, new_bias)))
+                    self.log(f"Point light shadow threshold set to {point.shadow_bias:.4f}")

@@ -56,6 +56,16 @@ class TransformState:
     bbox_roll: float = 0.0
 
 
+@dataclass
+class PointLightState:
+    enabled: bool = False
+    position: List[float] = field(default_factory=lambda: [0.0, 1.0, 0.0])
+    intensity: List[float] = field(default_factory=lambda: [100.0, 100.0, 100.0])
+    enable_shadow: bool = False
+    shadow_bias: float = 0.3
+    shadow_resolution: int = 2048
+
+
 class ViewerState:
     """Keeps every bit of long-lived state for the viewer."""
 
@@ -120,6 +130,17 @@ class ViewerState:
         )
         self.target = self.models[0].get_xyz.mean(dim=0).detach().cpu().numpy()
         self.camera.look_at(self.target, distance=1.0)
+
+        self.point_light = PointLightState(
+            position=list(self.camera.camera_center.detach().cpu().tolist())
+        )
+        self._point_shadow_cache: Dict[str, object] = {
+            "depth_cubemap": None,
+            "opacity_cubemap": None,
+            "position": None,
+            "resolution": None,
+            "dirty": True,
+        }
 
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
         self.enable_tone = args.tone
@@ -241,6 +262,7 @@ class ViewerState:
             self.model_render_cache[idx]["attrs"] = None
         self.joint_render_cache["dirty"] = True
         self.joint_render_cache["attrs"] = None
+        self.mark_point_light_dirty()
 
     def mark_all_models_dirty(self) -> None:
         for cache in self.model_render_cache:
@@ -248,6 +270,19 @@ class ViewerState:
             cache["attrs"] = None
         self.joint_render_cache["dirty"] = True
         self.joint_render_cache["attrs"] = None
+        self.mark_point_light_dirty()
+
+    def mark_point_light_dirty(self) -> None:
+        self._point_shadow_cache["dirty"] = True
+
+    def get_point_light_position_tensor(self) -> torch.Tensor:
+        return torch.tensor(self.point_light.position, device=self.device, dtype=torch.float32)
+
+    def get_point_light_intensity_tensor(self) -> torch.Tensor:
+        return torch.tensor(self.point_light.intensity, device=self.device, dtype=torch.float32)
+
+    def get_point_light_shadow_cache(self) -> Dict[str, object]:
+        return self._point_shadow_cache
 
     # ---- rendering helpers ---------------------------------------------------------
     def _compute_model_attributes(self, model: GaussianModel, trans: Dict[str, object]) -> Dict[str, torch.Tensor]:
