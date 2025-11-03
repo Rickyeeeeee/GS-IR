@@ -147,6 +147,104 @@ class ViewerRenderer:
         self.has_image = False
         self._last_uploaded_shape: Optional[Tuple[int, int, int]] = None
         self.resolution_scale: float = 1.0
+        self.mesh_context = self._create_mesh_context()
+        self.meshes = list(self.state.loaded_meshes) if self.mesh_context is not None else []
+
+    def _create_mesh_context(self):
+        if self.state.device.type != "cuda":
+            return None
+        try:
+            return dr.RasterizeCudaContext()
+        except Exception:
+            return None
+
+    def _world_to_clip(self, positions: torch.Tensor, view) -> torch.Tensor:
+        ones = torch.ones((positions.shape[0], 1), device=positions.device, dtype=positions.dtype)
+        pos_h = torch.cat([positions, ones], dim=-1)
+        view_matrix = view.world_view_transform.T
+        proj_matrix = view.projection_matrix.T
+        view_proj = proj_matrix @ view_matrix
+        pos_clip = torch.matmul(pos_h, view_proj.T)
+        return pos_clip[None, ...]
+
+    def _render_mesh_gbuffer(
+        self, view, mesh: Dict[str, torch.Tensor], height: int, width: int
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if self.mesh_context is None:
+            return None
+
+        pos_clip = self._world_to_clip(mesh["positions"], view)
+        try:
+            rast, _ = dr.rasterize(self.mesh_context, pos_clip, mesh["indices"], resolution=[height, width])
+        except RuntimeError:
+            return None
+
+        mask = torch.clamp(rast[..., 3:], 0.0, 1.0)
+        mask_bool = mask > 0.0
+
+        normals, _ = dr.interpolate(mesh["normals"][None, ...], rast, mesh["indices"])
+        normals = F.normalize(normals, dim=-1, eps=1e-6)
+        world_pos, _ = dr.interpolate(mesh["positions"][None, ...], rast, mesh["indices"])
+
+        uv_map = None
+        if mesh.get("uvs") is not None:
+            uv_interp, _ = dr.interpolate(mesh["uvs"][None, ...], rast, mesh["indices"])
+            uv_map = uv_interp[..., :2]
+            uv_map[..., 1] = 1.0 - uv_map[..., 1]
+
+        device = normals.device
+        H, W = mask.shape[1:3]
+
+        base_factor = mesh["base_color_factor"].to(device).view(1, 1, 1, 3)
+        albedo = base_factor.expand(1, H, W, 3).clone()
+        base_texture = mesh.get("base_color_texture")
+        if base_texture is not None and uv_map is not None:
+            tex = base_texture
+            tex_sample = dr.texture(
+                tex[None, ...],
+                uv_map.contiguous(),
+                filter_mode="linear",
+                boundary_mode="clamp",
+            )
+            albedo = albedo * tex_sample[..., :3]
+
+        rough_factor = mesh["roughness_factor"].to(device).view(1, 1, 1, 1)
+        metallic_factor = mesh["metallic_factor"].to(device).view(1, 1, 1, 1)
+        roughness = rough_factor.expand(1, H, W, 1).clone()
+        metallic = metallic_factor.expand(1, H, W, 1).clone()
+
+        mr_texture = mesh.get("metallic_roughness_texture")
+        if mr_texture is not None and uv_map is not None:
+            tex = mr_texture
+            mr_sample = dr.texture(
+                tex[None, ...],
+                uv_map.contiguous(),
+                filter_mode="linear",
+                boundary_mode="clamp",
+            )
+            if mr_sample.shape[-1] >= 3:
+                metallic = metallic * mr_sample[..., 2:3].clamp(0.0, 1.0)
+                roughness = roughness * mr_sample[..., 1:2].clamp(0.0, 1.0)
+            elif mr_sample.shape[-1] == 2:
+                roughness = roughness * mr_sample[..., 1:2].clamp(0.0, 1.0)
+            elif mr_sample.shape[-1] >= 1:
+                roughness = roughness * mr_sample[..., 0:1].clamp(0.0, 1.0)
+
+        normals = torch.where(mask_bool.expand_as(normals), normals, torch.zeros_like(normals))
+        world_pos = torch.where(mask_bool.expand_as(world_pos), world_pos, torch.zeros_like(world_pos))
+        albedo = torch.where(mask_bool.expand_as(albedo), albedo, torch.zeros_like(albedo))
+        roughness = torch.where(mask_bool.expand_as(roughness), roughness, torch.zeros_like(roughness))
+        metallic = torch.where(mask_bool.expand_as(metallic), metallic, torch.zeros_like(metallic))
+
+        return {
+            "mask": mask[0].contiguous(),
+            "mask_bool": mask_bool[0].contiguous(),
+            "normal": normals[0].contiguous(),
+            "albedo": albedo[0].contiguous(),
+            "roughness": roughness[0].contiguous(),
+            "metallic": metallic[0].contiguous(),
+            "world": world_pos[0].contiguous(),
+        }
 
     def _compute_point_light_depth_cubemap(
         self, gaussians, position: torch.Tensor, resolution: int
@@ -408,8 +506,6 @@ class ViewerRenderer:
             metallic_map = rendering_result["metallic_map"]
             depth_map = rendering_result["depth_map"]
 
-            # PBR mesh pass: render a simple pbr mesh
-
             H, W = view.image_height, view.image_width
             c2w = torch.inverse(view.world_view_transform.T)
             canonical_rays = get_canonical_rays(H, W, view.FoVx, view.FoVy)
@@ -419,12 +515,92 @@ class ViewerRenderer:
             )
             ray_norm = torch.norm(canonical_rays, p=2, dim=-1).reshape(H, W, 1)
 
-            points_world: Optional[torch.Tensor] = None
-            if state.point_light.enabled:
-                points_world = (
-                    -view_dirs.reshape(-1, 3) * ray_norm.reshape(-1, 1) * depth_map.reshape(-1, 1)
-                    + c2w[:3, 3]
-                ).reshape(H, W, 3)
+            camera_center = c2w[:3, 3]
+            gaussian_points_world = (
+                -view_dirs.reshape(-1, 3) * ray_norm.reshape(-1, 1) * depth_map.reshape(-1, 1)
+                + camera_center
+            ).reshape(H, W, 3)
+
+            normal_hw = normal_map.permute(1, 2, 0)
+            normal_mask_hw = normal_mask.permute(1, 2, 0)
+            albedo_hw = albedo_map.permute(1, 2, 0)
+            roughness_hw = roughness_map.permute(1, 2, 0)
+            metallic_hw = metallic_map.permute(1, 2, 0)
+            opacity_hw = opacity_mask.permute(1, 2, 0)
+
+            combined_normal_hw = normal_hw
+            combined_normal_mask_hw = normal_mask_hw
+            combined_albedo_hw = albedo_hw
+            combined_roughness_hw = roughness_hw
+            combined_metallic_hw = metallic_hw
+            combined_opacity_hw = opacity_hw
+            combined_points_world = gaussian_points_world
+
+            current_depth_world = torch.norm(
+                gaussian_points_world - camera_center.view(1, 1, 3),
+                dim=-1,
+                keepdim=True,
+            )
+            current_depth_world = torch.where(
+                opacity_hw > 0.0,
+                current_depth_world,
+                torch.full_like(current_depth_world, 1e6),
+            )
+
+            if self.mesh_context is not None and self.meshes:
+                for mesh in self.meshes:
+                    mesh_buffers = self._render_mesh_gbuffer(view, mesh, H, W)
+                    if mesh_buffers is None:
+                        continue
+
+                    mesh_mask_hw = mesh_buffers["mask"]
+                    mesh_mask_bool_hw = mesh_buffers["mask_bool"]
+                    mesh_normal_hw = mesh_buffers["normal"]
+                    mesh_albedo_hw = mesh_buffers["albedo"]
+                    mesh_roughness_hw = mesh_buffers["roughness"]
+                    mesh_metallic_hw = mesh_buffers["metallic"]
+                    mesh_world_hw = mesh_buffers["world"]
+
+                    mesh_depth_world = torch.norm(
+                        mesh_world_hw - camera_center.view(1, 1, 3),
+                        dim=-1,
+                        keepdim=True,
+                    )
+                    mesh_depth_world = torch.where(
+                        mesh_mask_bool_hw,
+                        mesh_depth_world,
+                        torch.full_like(mesh_depth_world, 1e6),
+                    )
+
+                    mesh_closer = torch.logical_and(mesh_depth_world < current_depth_world, mesh_mask_bool_hw)
+                    mesh_closer_vec3 = mesh_closer.expand(-1, -1, 3)
+
+                    combined_normal_hw = torch.where(mesh_closer_vec3, mesh_normal_hw, combined_normal_hw)
+                    combined_albedo_hw = torch.where(mesh_closer_vec3, mesh_albedo_hw, combined_albedo_hw)
+                    combined_points_world = torch.where(mesh_closer_vec3, mesh_world_hw, combined_points_world)
+                    combined_metallic_hw = torch.where(mesh_closer, mesh_metallic_hw, combined_metallic_hw)
+                    combined_roughness_hw = torch.where(mesh_closer, mesh_roughness_hw, combined_roughness_hw)
+                    combined_opacity_hw = torch.where(mesh_closer, mesh_mask_hw, combined_opacity_hw)
+                    combined_normal_mask_hw = torch.where(mesh_closer, mesh_mask_bool_hw, combined_normal_mask_hw)
+                    current_depth_world = torch.where(mesh_closer, mesh_depth_world, current_depth_world)
+
+            diff = camera_center.view(1, 1, 3) - combined_points_world
+            depth_along_dir = torch.sum(diff * view_dirs, dim=-1, keepdim=True) / (ray_norm + 1e-6)
+            depth_along_dir = torch.where(
+                combined_opacity_hw > 0.0,
+                depth_along_dir,
+                torch.zeros_like(depth_along_dir),
+            )
+            depth_map = depth_along_dir.permute(2, 0, 1).contiguous()
+
+            normal_map = combined_normal_hw.permute(2, 0, 1).contiguous()
+            normal_mask = combined_normal_mask_hw.permute(2, 0, 1).contiguous()
+            albedo_map = combined_albedo_hw.permute(2, 0, 1).contiguous()
+            roughness_map = combined_roughness_hw.permute(2, 0, 1).contiguous()
+            metallic_map = combined_metallic_hw.permute(2, 0, 1).contiguous()
+            opacity_mask = combined_opacity_hw.permute(2, 0, 1).contiguous()
+
+            t_after_mesh = time.perf_counter()
 
             env_yaw_rad = torch.tensor(state.hdri_rotation_deg * (torch.pi / 180.0), device=view_dirs.device)
             env_cos_yaw = torch.cos(env_yaw_rad)
@@ -449,6 +625,7 @@ class ViewerRenderer:
 
             render_rgb = result["render_rgb"].clamp(0.0, 1.0)
 
+            points_world = combined_points_world if state.point_light.enabled else None
             point_light_rgb = self._compute_point_light_shading(
                 gaussians=gaussians,
                 points=points_world,
@@ -475,7 +652,8 @@ class ViewerRenderer:
         state.profile_timings = {
             "prepare": (t_after_prepare - t_start) * 1000.0,
             "render": (t_after_render - t_after_prepare) * 1000.0,
-            "shading": (t_after_shading - t_after_render) * 1000.0,
+            "mesh": (t_after_mesh - t_after_render) * 1000.0,
+            "shading": (t_after_shading - t_after_mesh) * 1000.0,
             "composite": (t_after_env - t_after_shading) * 1000.0,
             "total": (t_after_env - t_start) * 1000.0,
             "gaussian_count": float(state.render_gaussians.get_xyz.shape[0]),
@@ -494,8 +672,8 @@ class ViewerRenderer:
         #     self.last_render_error = str(exc)
         #     self.has_image = False
 
-    def ensure_camera_matches_size(self, width: int, height: int) -> None:
-        self.state.update_camera_resolution(width, height)
+    def ensure_camera_matches_size(self, width: int, height: int) -> bool:
+        return self.state.update_camera_resolution(width, height)
 
     def ensure_render_texture(self) -> Tuple[Optional[int], float, Optional[str]]:
         if not self.has_image or self.render_image_tensor is None:

@@ -790,6 +790,7 @@ if __name__ == "__main__":
     parser.add_argument("--metallic", action="store_true", help="Use reconstructed metallic map.")
     parser.add_argument("--no_env_bg", action="store_true", help="Disable compositing HDRI as background.")
     parser.add_argument("--transform_state", type=str, default="viewer_transforms.json", help="Path to store/load per-model transform adjustments.")
+    parser.add_argument("--mesh", type=str, nargs="+", default=None, help="Path(s) to glTF/GLB mesh files to load.")
 
     # Temporarily parse for config path
     temp_args, _ = parser.parse_known_args()

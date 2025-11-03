@@ -22,6 +22,7 @@ from utils.viewer_utils import (
     read_hdr,
 )
 from viewer_camera import ViewerCamera
+from .mesh_loader import load_pbr_meshes
 
 
 HDRI_PRESETS: List[Tuple[str, str]] = [
@@ -149,6 +150,11 @@ class ViewerState:
         self.show_env_bg = not getattr(args, "no_env_bg", False)
 
         self.hdri = self.hdri_cache_latlong[self.hdri_label_current]
+
+        mesh_specs = getattr(args, "mesh", None)
+        if mesh_specs is None and hasattr(args, "meshes"):
+            mesh_specs = getattr(args, "meshes")
+        self.loaded_meshes = load_pbr_meshes(mesh_specs, self.device) if mesh_specs else []
 
         self.load_transform_state()
 
@@ -396,11 +402,11 @@ class ViewerState:
         bg_mask = 1.0 - opacity_mask.permute(1, 2, 0).clamp(0.0, 1.0)
         return render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
 
-    def update_camera_resolution(self, width: int, height: int) -> None:
+    def update_camera_resolution(self, width: int, height: int) -> bool:
         width = max(1, int(width))
         height = max(1, int(height))
         if width == self.camera.image_width and height == self.camera.image_height:
-            return
+            return False
 
         aspect = float(width) / float(height)
         tan_half_y = float(self.camera.FoVy)
@@ -422,3 +428,4 @@ class ViewerState:
         self.camera.original_image = self.camera.image.clone()
         self.camera.image_width = width
         self.camera.image_height = height
+        return True

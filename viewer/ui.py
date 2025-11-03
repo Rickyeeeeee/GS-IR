@@ -15,6 +15,9 @@ class ViewerUI:
     def __init__(self, state: ViewerState, renderer: ViewerRenderer, log_fn=print) -> None:
         self.state = state
         self.renderer = renderer
+
+        self.camera_first_update = False
+
         self.log = log_fn
 
         self.render_window_hovered = False
@@ -91,6 +94,7 @@ class ViewerUI:
         if timings:
             imgui.text(f"Prepare: {timings.get('prepare', float('nan')):.2f} ms")
             imgui.text(f"Render: {timings.get('render', float('nan')):.2f} ms")
+            imgui.text(f"Mesh: {timings.get('mesh', float('nan')):.2f} ms")
             imgui.text(f"Shading: {timings.get('shading', float('nan')):.2f} ms")
             imgui.text(f"Composite: {timings.get('composite', float('nan')):.2f} ms")
             imgui.text(f"Total: {timings.get('total', float('nan')):.2f} ms")
@@ -158,7 +162,11 @@ class ViewerUI:
                 scale = self.renderer.resolution_scale
                 target_w = max(1, int(avail_w * scale))
                 target_h = max(1, int(avail_h * scale))
-                self.renderer.ensure_camera_matches_size(target_w, target_h)
+                changed = self.renderer.ensure_camera_matches_size(target_w, target_h)
+                if not self.camera_first_update and changed:
+                    self.camera_first_update = True
+                    self.renderer.resolution_scale = 720 / self.state.camera.image_height
+                    
 
                 texture_id, upload_ms, texture_error = self.renderer.ensure_render_texture()
                 self.renderer.image_display_time_ms = upload_ms
