@@ -46,6 +46,11 @@ def build_parser() -> ArgumentParser:
         default=100_000,
         help="Maximum number of CUDA memory events to record when --cuda_mem_snapshot is used.",
     )
+    parser.add_argument(
+        "--torch_profiler",
+        action="store_true",
+        help="Profile a render frame with torch.profiler when the viewer starts.",
+    )
     parser.set_defaults(pipeline_spec=pipeline)
     return parser
 

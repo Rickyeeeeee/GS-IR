@@ -12,6 +12,5 @@
   "metallic": true,
   "eval": true,
   "meshes": [
-    "/workspace/data/Datasets/ITRI_Relighting_Demo/SheenChair.glb"
   ]
 }

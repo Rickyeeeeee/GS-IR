@@ -93,8 +93,8 @@ class ViewerUI:
         timings = self.state.profile_timings
         if timings:
             imgui.text(f"Prepare: {timings.get('prepare', float('nan')):.2f} ms")
-            imgui.text(f"Render: {timings.get('render', float('nan')):.2f} ms")
-            imgui.text(f"Mesh: {timings.get('mesh', float('nan')):.2f} ms")
+            imgui.text(f"GS Render: {timings.get('render', float('nan')):.2f} ms")
+            imgui.text(f"Mesh Render: {timings.get('mesh', float('nan')):.2f} ms")
             imgui.text(f"Shading: {timings.get('shading', float('nan')):.2f} ms")
             imgui.text(f"Composite: {timings.get('composite', float('nan')):.2f} ms")
             imgui.text(f"Total: {timings.get('total', float('nan')):.2f} ms")

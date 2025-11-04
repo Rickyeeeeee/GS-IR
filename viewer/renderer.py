@@ -149,6 +149,9 @@ class ViewerRenderer:
         self.resolution_scale: float = 1.0
         self.mesh_context = self._create_mesh_context()
         self.meshes = list(self.state.loaded_meshes) if self.mesh_context is not None else []
+        self._torch_profiler_enabled = bool(getattr(state.args, "torch_profiler", False))
+        self._torch_profiler_ran = False
+        self._torch_profiler_warning_emitted = False
 
     def _create_mesh_context(self):
         if self.state.device.type != "cuda":
@@ -478,11 +481,52 @@ class ViewerRenderer:
         return render_rgb
 
     def render_current(self) -> torch.Tensor:
+        if not self._torch_profiler_enabled:
+            return self._render_current_impl()
+
+        if self._torch_profiler_ran:
+            return self._render_current_impl()
+
+        try:
+            from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
+        except ImportError:
+            if not self._torch_profiler_warning_emitted:
+                print("[viewer] torch.profiler is unavailable; skipping --torch_profiler.", flush=True)
+                self._torch_profiler_warning_emitted = True
+            self._torch_profiler_enabled = False
+            return self._render_current_impl()
+
+        activities = [ProfilerActivity.CPU]
+        if self.state.device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        sched = schedule(wait=1, warmup=2, active=5, repeat=1)  # adjust window to your step time
+
+        with profile(
+            activities=activities,
+            # schedule=sched,
+            on_trace_ready=tensorboard_trace_handler("logs/prof_run"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            result = self._render_current_impl()
+
+        sort_key = "cuda_time_total" if self.state.device.type == "cuda" else "self_cpu_time_total"
+        try:
+            table = prof.key_averages().table(sort_by=sort_key, row_limit=50)
+            print("[torch-profiler] render_current() results:\n" + table, flush=True)
+        except ValueError:
+            print("[torch-profiler] No events recorded during render_current().", flush=True)
+
+        self._torch_profiler_ran = True
+        return result
+
+    def _render_current_impl(self) -> torch.Tensor:
         state = self.state
         t_start = time.perf_counter()
         gaussians = state.prepare_render_gaussians()
         t_after_prepare = time.perf_counter()
-        
+
         with torch.no_grad():
 
             view = state.camera
@@ -492,9 +536,9 @@ class ViewerRenderer:
                 pipe=state.args.pipeline,
                 bg_color=state.background,
                 inference=True,
-                pad_normal=True,
-                derive_normal=True,
-                argmax_depth=True
+                pad_normal=False,
+                derive_normal=False,
+                argmax_depth=False
             )
             t_after_render = time.perf_counter()
 
