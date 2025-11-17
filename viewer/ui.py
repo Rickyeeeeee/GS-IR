@@ -90,6 +90,23 @@ class ViewerUI:
 
         imgui.separator()
         imgui.text("Profiling")
+        profiler_available = self.renderer.is_profiler_available()
+        begin_disabled = getattr(imgui, "begin_disabled", None)
+        end_disabled = getattr(imgui, "end_disabled", None)
+        disabled_scope = not profiler_available and callable(begin_disabled) and callable(end_disabled)
+        if disabled_scope:
+            begin_disabled(True)
+        if imgui.button("Profile Next Frame"):
+            if self.renderer.request_profiler_capture():
+                self.log("Queued torch.profiler capture for next frame")
+            else:
+                self.log("Torch profiler unavailable; capture request ignored")
+        if disabled_scope:
+            end_disabled()
+            imgui.same_line()
+            imgui.text_disabled("torch.profiler unavailable")
+        elif not profiler_available:
+            imgui.text_disabled("torch.profiler unavailable")
         timings = self.state.profile_timings
         if timings:
             imgui.text(f"Prepare: {timings.get('prepare', float('nan')):.2f} ms")

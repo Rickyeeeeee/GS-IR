@@ -21,6 +21,16 @@ from .state import ViewerState
 def saturate_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a * b).sum(dim=-1, keepdim=True).clamp(min=0.0, max=1.0)
 
+def se3_inv(T):  # (...,4,4)
+    R = T[..., :3, :3]
+    t = T[..., :3, 3:4]
+    Rt = R.transpose(-1, -2)      # R^T
+    tinv = (-Rt @ t)
+    out = T.clone()
+    out[..., :3, :3] = Rt
+    out[..., :3, 3:4] = tinv
+    out[..., 3, :] = T.new_tensor([0,0,0,1])
+    return out
 
 def DistributionGGX(
     normals: torch.Tensor,  # [H, W, 3]
@@ -149,9 +159,12 @@ class ViewerRenderer:
         self.resolution_scale: float = 1.0
         self.mesh_context = self._create_mesh_context()
         self.meshes = list(self.state.loaded_meshes) if self.mesh_context is not None else []
-        self._torch_profiler_enabled = bool(getattr(state.args, "torch_profiler", False))
+        profiler_flag = bool(getattr(state.args, "torch_profiler", False))
+        self._torch_profiler_default_enabled = profiler_flag
+        self._torch_profiler_enabled = profiler_flag
         self._torch_profiler_ran = False
         self._torch_profiler_warning_emitted = False
+        self._torch_profiler_manual_pending = False
 
     def _create_mesh_context(self):
         if self.state.device.type != "cuda":
@@ -160,6 +173,30 @@ class ViewerRenderer:
             return dr.RasterizeCudaContext()
         except Exception:
             return None
+
+    @staticmethod
+    def _torch_profiler_available() -> bool:
+        try:
+            import torch.profiler  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def is_profiler_available(self) -> bool:
+        return self._torch_profiler_available()
+
+    def request_profiler_capture(self) -> bool:
+        if not self._torch_profiler_available():
+            if not self._torch_profiler_warning_emitted:
+                print("[viewer] torch.profiler is unavailable; cannot capture frame.", flush=True)
+                self._torch_profiler_warning_emitted = True
+            return False
+
+        self._torch_profiler_enabled = True
+        self._torch_profiler_ran = False
+        if not self._torch_profiler_default_enabled:
+            self._torch_profiler_manual_pending = True
+        return True
 
     def _world_to_clip(self, positions: torch.Tensor, view) -> torch.Tensor:
         ones = torch.ones((positions.shape[0], 1), device=positions.device, dtype=positions.dtype)
@@ -494,6 +531,7 @@ class ViewerRenderer:
                 print("[viewer] torch.profiler is unavailable; skipping --torch_profiler.", flush=True)
                 self._torch_profiler_warning_emitted = True
             self._torch_profiler_enabled = False
+            self._torch_profiler_manual_pending = False
             return self._render_current_impl()
 
         activities = [ProfilerActivity.CPU]
@@ -519,6 +557,9 @@ class ViewerRenderer:
             print("[torch-profiler] No events recorded during render_current().", flush=True)
 
         self._torch_profiler_ran = True
+        if self._torch_profiler_manual_pending:
+            self._torch_profiler_manual_pending = False
+            self._torch_profiler_enabled = False
         return result
 
     def _render_current_impl(self) -> torch.Tensor:
@@ -536,8 +577,8 @@ class ViewerRenderer:
                 pipe=state.args.pipeline,
                 bg_color=state.background,
                 inference=True,
-                pad_normal=False,
-                derive_normal=False,
+                pad_normal=True,
+                derive_normal=True,
                 argmax_depth=False
             )
             t_after_render = time.perf_counter()
@@ -551,8 +592,9 @@ class ViewerRenderer:
             depth_map = rendering_result["depth_map"]
 
             H, W = view.image_height, view.image_width
-            c2w = torch.inverse(view.world_view_transform.T)
-            canonical_rays = get_canonical_rays(H, W, view.FoVx, view.FoVy)
+            # c2w = torch.inverse(view.world_view_transform.T)
+            c2w = se3_inv(view.world_view_transform.T)
+            canonical_rays = view.get_canonical_rays()
             normalized_dirs = F.normalize(canonical_rays[:, None, :], p=2, dim=-1)
             view_dirs = -(
                 (normalized_dirs * c2w[None, :3, :3]).sum(dim=-1).reshape(H, W, 3)

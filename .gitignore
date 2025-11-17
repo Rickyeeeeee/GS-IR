@@ -12,3 +12,4 @@ dataset
 dataset_local
 test
 *egg-info*
+logs/

@@ -4,6 +4,7 @@ import math
 from typing import Optional
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 from scene.cameras import Camera
+from utils.viewer_utils import get_canonical_rays
 
 # -- helper function for rotation --
 def rotation_matrix_from_yaw_pitch(yaw: float, pitch: float) -> np.ndarray:
@@ -74,6 +75,20 @@ class ViewerCamera(Camera):
 
         # initial update
         self.update_matrices()
+        self.canonical_rays = None
+        self.update_canonical_rays()
+
+
+    def update_canonical_rays(self):
+        self.canonical_rays = get_canonical_rays(
+            self.image_height,
+            self.image_width,
+            self.FoVx,
+            self.FoVy
+        )
+
+    def get_canonical_rays(self):
+        return self.canonical_rays
 
     # ---------- setters ----------
     def set_position(self, pos: np.ndarray):

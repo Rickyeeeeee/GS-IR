@@ -125,8 +125,8 @@ class ViewerState:
         self.camera = ViewerCamera(
             FoVx=1.6609910500147054,
             FoVy=1.103431263015383,
-            W=args.width - 320,
-            H=args.height - 40,
+            W=args.width,
+            H=args.height,
             data_device="cuda",
         )
         self.target = self.models[0].get_xyz.mean(dim=0).detach().cpu().numpy()
@@ -428,4 +428,5 @@ class ViewerState:
         self.camera.original_image = self.camera.image.clone()
         self.camera.image_width = width
         self.camera.image_height = height
+        self.camera.update_canonical_rays()
         return True

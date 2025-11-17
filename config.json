@@ -11,6 +11,7 @@
   "gamma": true,
   "metallic": true,
   "eval": true,
-  "meshes": [
+  "mh": [
+    "/workspace/data/Datasets/ITRI_Relighting_Demo/SheenChair.glb"
   ]
 }
