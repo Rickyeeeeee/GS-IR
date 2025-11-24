@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -13,7 +14,7 @@ from gaussian_renderer import render
 from pbr import pbr_shading
 from pbr.shade import aces_film as pbr_aces_film, linear_to_srgb as pbr_linear_to_srgb
 from utils.graphics_utils import getProjectionMatrix
-from utils.viewer_utils import get_canonical_rays
+from utils.viewer_utils import euler_to_matrix, get_canonical_rays
 
 from .gl_utils import CpuTextureBackend, CudaTextureBackend, create_texture_backend
 from .state import ViewerState
@@ -285,6 +286,89 @@ class ViewerRenderer:
             "metallic": metallic[0].contiguous(),
             "world": world_pos[0].contiguous(),
         }
+
+    def _apply_mesh_transform(
+        self, mesh: Dict[str, torch.Tensor], trans: Dict[str, float | List[float]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = mesh["positions"]
+        normals = mesh["normals"]
+        device = positions.device
+        dtype = positions.dtype
+
+        yaw = math.radians(float(trans.get("yaw", 0.0)))
+        pitch = math.radians(float(trans.get("pitch", 0.0)))
+        roll = math.radians(float(trans.get("roll", 0.0)))
+        scale = max(float(trans.get("scale", 1.0)), 1e-6)
+        translation = torch.tensor(trans.get("translation", [0.0, 0.0, 0.0]), device=device, dtype=dtype)
+
+        rot_np = euler_to_matrix(yaw, pitch, roll)
+        rot = torch.from_numpy(rot_np).to(device=device, dtype=dtype)
+
+        transformed_pos = (positions @ rot.T) * scale + translation
+        transformed_normals = normals @ rot.T
+        return transformed_pos.contiguous(), transformed_normals.contiguous()
+
+    def _render_meshes_gbuffer(
+        self, view, height: int, width: int, camera_center: torch.Tensor
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if self.mesh_context is None or not self.meshes:
+            return None
+
+        device = camera_center.device
+        dtype = camera_center.dtype
+        default_depth = torch.full((height, width, 1), 1e6, device=device, dtype=dtype)
+        combined = {
+            "mask": torch.zeros((height, width, 1), device=device, dtype=dtype),
+            "mask_bool": torch.zeros((height, width, 1), device=device, dtype=torch.bool),
+            "normal": torch.zeros((height, width, 3), device=device, dtype=dtype),
+            "albedo": torch.zeros((height, width, 3), device=device, dtype=dtype),
+            "roughness": torch.zeros((height, width, 1), device=device, dtype=dtype),
+            "metallic": torch.zeros((height, width, 1), device=device, dtype=dtype),
+            "world": torch.zeros((height, width, 3), device=device, dtype=dtype),
+            "depth": default_depth.clone(),
+        }
+
+        for mesh_idx, mesh in enumerate(self.meshes):
+            trans = None
+            if hasattr(self.state, "mesh_group_transforms") and hasattr(self.state, "mesh_segment_to_group"):
+                if mesh_idx < len(self.state.mesh_segment_to_group):
+                    group_idx = self.state.mesh_segment_to_group[mesh_idx]
+                    if 0 <= group_idx < len(self.state.mesh_group_transforms):
+                        trans = self.state.mesh_group_transforms[group_idx]
+
+            mesh_input = mesh
+            if trans is not None:
+                transformed_pos, transformed_normals = self._apply_mesh_transform(mesh, trans)
+                mesh_input = dict(mesh)
+                mesh_input["positions"] = transformed_pos
+                mesh_input["normals"] = transformed_normals
+
+            mesh_buffers = self._render_mesh_gbuffer(view, mesh_input, height, width)
+            if mesh_buffers is None:
+                continue
+
+            mesh_mask = mesh_buffers["mask"]
+            mesh_mask_bool = mesh_buffers["mask_bool"]
+            mesh_world = mesh_buffers["world"]
+
+            mesh_depth = torch.norm(mesh_world - camera_center.view(1, 1, 3), dim=-1, keepdim=True)
+            mesh_depth = torch.where(mesh_mask_bool, mesh_depth, default_depth)
+
+            mesh_closer = torch.logical_and(mesh_depth < combined["depth"], mesh_mask_bool)
+            mesh_closer_vec3 = mesh_closer.expand(-1, -1, 3)
+
+            combined["normal"] = torch.where(mesh_closer_vec3, mesh_buffers["normal"], combined["normal"])
+            combined["albedo"] = torch.where(mesh_closer_vec3, mesh_buffers["albedo"], combined["albedo"])
+            combined["world"] = torch.where(mesh_closer_vec3, mesh_buffers["world"], combined["world"])
+            combined["metallic"] = torch.where(mesh_closer, mesh_buffers["metallic"], combined["metallic"])
+            combined["roughness"] = torch.where(mesh_closer, mesh_buffers["roughness"], combined["roughness"])
+            combined["mask"] = torch.where(mesh_closer, mesh_mask, combined["mask"])
+            combined["mask_bool"] = torch.where(mesh_closer, mesh_mask_bool, combined["mask_bool"])
+            combined["depth"] = torch.where(mesh_closer, mesh_depth, combined["depth"])
+
+        if combined["mask_bool"].any():
+            return combined
+        return None
 
     def _compute_point_light_depth_cubemap(
         self, gaussians, position: torch.Tensor, resolution: int
@@ -633,42 +717,22 @@ class ViewerRenderer:
                 torch.full_like(current_depth_world, 1e6),
             )
 
-            if self.mesh_context is not None and self.meshes:
-                for mesh in self.meshes:
-                    mesh_buffers = self._render_mesh_gbuffer(view, mesh, H, W)
-                    if mesh_buffers is None:
-                        continue
+            mesh_gbuffer = self._render_meshes_gbuffer(view, H, W, camera_center)
+            if mesh_gbuffer is not None:
+                mesh_depth_world = mesh_gbuffer["depth"]
+                mesh_mask_bool_hw = mesh_gbuffer["mask_bool"]
+                mesh_mask_hw = mesh_gbuffer["mask"]
+                mesh_closer = torch.logical_and(mesh_depth_world < current_depth_world, mesh_mask_bool_hw)
+                mesh_closer_vec3 = mesh_closer.expand(-1, -1, 3)
 
-                    mesh_mask_hw = mesh_buffers["mask"]
-                    mesh_mask_bool_hw = mesh_buffers["mask_bool"]
-                    mesh_normal_hw = mesh_buffers["normal"]
-                    mesh_albedo_hw = mesh_buffers["albedo"]
-                    mesh_roughness_hw = mesh_buffers["roughness"]
-                    mesh_metallic_hw = mesh_buffers["metallic"]
-                    mesh_world_hw = mesh_buffers["world"]
-
-                    mesh_depth_world = torch.norm(
-                        mesh_world_hw - camera_center.view(1, 1, 3),
-                        dim=-1,
-                        keepdim=True,
-                    )
-                    mesh_depth_world = torch.where(
-                        mesh_mask_bool_hw,
-                        mesh_depth_world,
-                        torch.full_like(mesh_depth_world, 1e6),
-                    )
-
-                    mesh_closer = torch.logical_and(mesh_depth_world < current_depth_world, mesh_mask_bool_hw)
-                    mesh_closer_vec3 = mesh_closer.expand(-1, -1, 3)
-
-                    combined_normal_hw = torch.where(mesh_closer_vec3, mesh_normal_hw, combined_normal_hw)
-                    combined_albedo_hw = torch.where(mesh_closer_vec3, mesh_albedo_hw, combined_albedo_hw)
-                    combined_points_world = torch.where(mesh_closer_vec3, mesh_world_hw, combined_points_world)
-                    combined_metallic_hw = torch.where(mesh_closer, mesh_metallic_hw, combined_metallic_hw)
-                    combined_roughness_hw = torch.where(mesh_closer, mesh_roughness_hw, combined_roughness_hw)
-                    combined_opacity_hw = torch.where(mesh_closer, mesh_mask_hw, combined_opacity_hw)
-                    combined_normal_mask_hw = torch.where(mesh_closer, mesh_mask_bool_hw, combined_normal_mask_hw)
-                    current_depth_world = torch.where(mesh_closer, mesh_depth_world, current_depth_world)
+                combined_normal_hw = torch.where(mesh_closer_vec3, mesh_gbuffer["normal"], combined_normal_hw)
+                combined_albedo_hw = torch.where(mesh_closer_vec3, mesh_gbuffer["albedo"], combined_albedo_hw)
+                combined_points_world = torch.where(mesh_closer_vec3, mesh_gbuffer["world"], combined_points_world)
+                combined_metallic_hw = torch.where(mesh_closer, mesh_gbuffer["metallic"], combined_metallic_hw)
+                combined_roughness_hw = torch.where(mesh_closer, mesh_gbuffer["roughness"], combined_roughness_hw)
+                combined_opacity_hw = torch.where(mesh_closer, mesh_mask_hw, combined_opacity_hw)
+                combined_normal_mask_hw = torch.where(mesh_closer, mesh_mask_bool_hw, combined_normal_mask_hw)
+                current_depth_world = torch.where(mesh_closer, mesh_depth_world, current_depth_world)
 
             diff = camera_center.view(1, 1, 3) - combined_points_world
             depth_along_dir = torch.sum(diff * view_dirs, dim=-1, keepdim=True) / (ray_norm + 1e-6)

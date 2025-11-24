@@ -142,6 +142,14 @@ class ViewerState:
         self.point_light = PointLightState(
             position=list(self.camera.camera_center.detach().cpu().tolist())
         )
+        mesh_specs = getattr(args, "mesh", None)
+        if mesh_specs is None and hasattr(args, "meshes"):
+            mesh_specs = getattr(args, "meshes")
+        self.loaded_meshes = load_pbr_meshes(mesh_specs, self.device) if mesh_specs else []
+        self.mesh_group_names: List[str] = []
+        self.mesh_group_transforms: List[Dict[str, float | List[float]]] = []
+        self.mesh_segment_to_group: List[int] = []
+        self._build_mesh_groups()
         self._point_shadow_cache: Dict[str, object] = {
             "depth_cubemap": None,
             "opacity_cubemap": None,
@@ -157,11 +165,6 @@ class ViewerState:
         self.show_env_bg = not getattr(args, "no_env_bg", False)
 
         self.hdri = self.hdri_cache_latlong[self.hdri_label_current]
-
-        mesh_specs = getattr(args, "mesh", None)
-        if mesh_specs is None and hasattr(args, "meshes"):
-            mesh_specs = getattr(args, "meshes")
-        self.loaded_meshes = load_pbr_meshes(mesh_specs, self.device) if mesh_specs else []
 
         self.load_transform_state()
 
@@ -199,6 +202,21 @@ class ViewerState:
             if os.path.normpath(preset_path) == norm:
                 return label
         return self.hdri_labels[0]
+
+    def _build_mesh_groups(self) -> None:
+        """Group mesh segments by their source path for shared gizmo transforms."""
+        if not self.loaded_meshes:
+            return
+        groups: Dict[str, int] = {}
+        for seg_idx, mesh in enumerate(self.loaded_meshes):
+            src = str(mesh.get("source_path", f"mesh_{seg_idx}"))
+            if src not in groups:
+                group_idx = len(self.mesh_group_names)
+                groups[src] = group_idx
+                label = os.path.basename(src) or f"Mesh {group_idx + 1}"
+                self.mesh_group_names.append(label)
+                self.mesh_group_transforms.append(TransformState().__dict__.copy())
+            self.mesh_segment_to_group.append(groups[src])
 
     def ensure_hdri(self, label: str) -> None:
         path = self.hdri_paths[label]

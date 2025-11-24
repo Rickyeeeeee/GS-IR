@@ -517,7 +517,7 @@ def load_glb_pbr_mesh(path: str, extra_transform: Optional[np.ndarray] = None) -
 def load_pbr_meshes(
     mesh_specs: Optional[Union[Sequence[Any], str]],
     device: torch.device,
-) -> List[Dict[str, torch.Tensor | Optional[torch.Tensor]]]:
+) -> List[Dict[str, Any]]:
     if mesh_specs is None:
         return []
 
@@ -553,13 +553,14 @@ def load_pbr_meshes(
                 seg["positions"].shape[0],
                 seg["indices"].shape[0],
             )
-            entry: Dict[str, torch.Tensor | Optional[torch.Tensor]] = {
+            entry: Dict[str, Any] = {
                 "positions": torch.from_numpy(seg["positions"]).to(device=device, dtype=torch.float32).contiguous(),
                 "normals": torch.from_numpy(seg["normals"]).to(device=device, dtype=torch.float32).contiguous(),
                 "indices": torch.from_numpy(seg["indices"]).to(device=device, dtype=torch.int32).contiguous(),
                 "base_color_factor": torch.from_numpy(seg["base_color_factor"]).to(device=device, dtype=torch.float32),
                 "metallic_factor": torch.tensor(seg["metallic_factor"], device=device, dtype=torch.float32),
                 "roughness_factor": torch.tensor(seg["roughness_factor"], device=device, dtype=torch.float32),
+                "source_path": mesh_path,
             }
             if seg["uvs"] is not None:
                 entry["uvs"] = torch.from_numpy(seg["uvs"]).to(device=device, dtype=torch.float32).contiguous()

@@ -35,6 +35,8 @@ class ViewerUI:
         )
         self._gizmo_base_rotation = base_rotation
         self._gizmo_base_rotation_inv = base_rotation.T
+        self._gizmo_target_type = "model"  # "model" or "mesh"
+        self._gizmo_target_mesh_idx = 0
 
     # --------------------------------------------------------------------- windows --
     def draw_control_window(self, last_frame_dt: float, viewer_timings: dict[str, float]) -> None:
@@ -52,115 +54,145 @@ class ViewerUI:
         imgui.text(f"Frame Time: {last_frame_dt * 1000.0:.2f} ms")
         imgui.separator()
 
-        render_mode_index = 1 if self.state.render_jointly else 0
-        render_modes = ["Active Model", "Joint (Concatenated)"]
-        changed, new_mode_idx = imgui.combo("Render Mode", render_mode_index, render_modes)
-        if changed:
-            self.state.render_jointly = new_mode_idx == 1
-            self.state.mark_all_models_dirty()
-            self.log(f"Render mode set to {render_modes[new_mode_idx]}")
+        indent = getattr(imgui, "indent", None)
+        unindent = getattr(imgui, "unindent", None)
 
-        imgui.separator()
-        if imgui.begin_combo("Active Model", self.state.model_names[self.state.active_model_idx]):
-            for idx, name in enumerate(self.state.model_names):
-                selected = idx == self.state.active_model_idx
-                if imgui.selectable(name, selected)[0] and not selected:
-                    self.state.active_model_idx = idx
-                    self.state.mark_model_dirty(idx)
-                    self.log(f"Active model set to {name}")
-                if selected:
-                    imgui.set_item_default_focus()
-            imgui.end_combo()
+        if imgui.collapsing_header("Rendering", imgui.TreeNodeFlags_.default_open):
+            if callable(indent):
+                indent()
+            render_mode_index = 1 if self.state.render_jointly else 0
+            render_modes = ["Active Model", "Joint (Concatenated)"]
+            changed, new_mode_idx = imgui.combo("Render Mode", render_mode_index, render_modes)
+            if changed:
+                self.state.render_jointly = new_mode_idx == 1
+                self.state.mark_all_models_dirty()
+                self.log(f"Render mode set to {render_modes[new_mode_idx]}")
 
-        imgui.separator()
-        self._draw_transform_controls()
-        imgui.separator()
-        self._draw_environment_controls()
+            if imgui.begin_combo("Active Model", self.state.model_names[self.state.active_model_idx]):
+                for idx, name in enumerate(self.state.model_names):
+                    selected = idx == self.state.active_model_idx
+                    if imgui.selectable(name, selected)[0] and not selected:
+                        self.state.active_model_idx = idx
+                        self.state.mark_model_dirty(idx)
+                        self.log(f"Active model set to {name}")
+                    if selected:
+                        imgui.set_item_default_focus()
+                imgui.end_combo()
 
-        imgui.separator()
-        imgui.text("Render Resolution")
-        scale = self.renderer.resolution_scale
-        changed, new_scale = imgui.slider_float("Resolution Scale", scale, 0.25, 1.0, format="%.2f")
-        if changed:
-            self.renderer.set_resolution_scale(new_scale)
-            self.log(f"Resolution scale set to {new_scale:.2f}")
-        imgui.text(
-            f"Render Size: {int(self.state.camera.image_width)} x {int(self.state.camera.image_height)}"
-        )
-
-        imgui.separator()
-        imgui.text("Camera")
-        current_fovx = self.state.get_camera_fovx_degrees()
-        changed_fov, new_fovx = imgui.slider_float("FoVx (deg)", current_fovx, 10.0, 170.0, "%.1f")
-        if changed_fov:
-            if self.state.set_camera_fovx_degrees(new_fovx):
-                self.log(f"Camera FoVx set to {new_fovx:.1f} deg")
-
-        imgui.separator()
-        imgui.text("Profiling")
-        profiler_available = self.renderer.is_profiler_available()
-        begin_disabled = getattr(imgui, "begin_disabled", None)
-        end_disabled = getattr(imgui, "end_disabled", None)
-        disabled_scope = not profiler_available and callable(begin_disabled) and callable(end_disabled)
-        if disabled_scope:
-            begin_disabled(True)
-        if imgui.button("Profile Next Frame"):
-            if self.renderer.request_profiler_capture():
-                self.log("Queued torch.profiler capture for next frame")
-            else:
-                self.log("Torch profiler unavailable; capture request ignored")
-        if disabled_scope:
-            end_disabled()
-            imgui.same_line()
-            imgui.text_disabled("torch.profiler unavailable")
-        elif not profiler_available:
-            imgui.text_disabled("torch.profiler unavailable")
-        timings = self.state.profile_timings
-        if timings:
-            imgui.text(f"Prepare: {timings.get('prepare', float('nan')):.2f} ms")
-            imgui.text(f"GS Render: {timings.get('render', float('nan')):.2f} ms")
-            imgui.text(f"Mesh Render: {timings.get('mesh', float('nan')):.2f} ms")
-            imgui.text(f"Shading: {timings.get('shading', float('nan')):.2f} ms")
-            imgui.text(f"Composite: {timings.get('composite', float('nan')):.2f} ms")
-            imgui.text(f"Total: {timings.get('total', float('nan')):.2f} ms")
-            if "gaussian_count" in timings:
-                imgui.text(f"Gaussians: {int(timings['gaussian_count'])}")
-        else:
-            imgui.text("No timing data yet.")
-
-        if viewer_timings:
             imgui.separator()
-            imgui.text("Viewer Timing")
+            imgui.text("Render Resolution")
+            scale = self.renderer.resolution_scale
+            changed, new_scale = imgui.slider_float("Resolution Scale", scale, 0.25, 1.0, format="%.2f")
+            if changed:
+                self.renderer.set_resolution_scale(new_scale)
+                self.log(f"Resolution scale set to {new_scale:.2f}")
+            imgui.text(
+                f"Render Size: {int(self.state.camera.image_width)} x {int(self.state.camera.image_height)}"
+            )
+            if callable(unindent):
+                unindent()
 
-            def _fmt(key: str) -> str:
-                value = viewer_timings.get(key)
-                if value is None or not np.isfinite(value):
-                    return "--"
-                return f"{value:.2f} ms"
+        if imgui.collapsing_header("Transforms & Gizmo", imgui.TreeNodeFlags_.default_open):
+            if callable(indent):
+                indent()
+            self._draw_transform_controls()
+            if callable(unindent):
+                unindent()
 
-            imgui.text(f"Input: {_fmt('input')}")
-            imgui.text(f"Update Render: {_fmt('update_render')}")
-            imgui.text(f"Draw Controls: {_fmt('draw_control')}")
-            imgui.text(f"Draw Render: {_fmt('draw_render')}")
-            imgui.text(f"Image Display: {_fmt('image_display')}")
-            imgui.text(f"Frame (UI): {_fmt('frame')}")
+        if imgui.collapsing_header("Environment & Lighting", imgui.TreeNodeFlags_.default_open):
+            if callable(indent):
+                indent()
+            self._draw_environment_controls()
+            if callable(unindent):
+                unindent()
 
-        imgui.separator()
-        if imgui.button("Render Once"):
-            self.renderer.update_render_buffer()
-            self.log("Render Once button pressed")
-        imgui.same_line()
-        if imgui.button("Save Transforms"):
-            self.state.save_transform_state()
-            self.log("Save Transforms button pressed")
+        if imgui.collapsing_header("Camera", imgui.TreeNodeFlags_.default_open):
+            if callable(indent):
+                indent()
+            current_fovx = self.state.get_camera_fovx_degrees()
+            changed_fov, new_fovx = imgui.slider_float("FoVx (deg)", current_fovx, 10.0, 170.0, "%.1f")
+            if changed_fov:
+                if self.state.set_camera_fovx_degrees(new_fovx):
+                    self.log(f"Camera FoVx set to {new_fovx:.1f} deg")
+            if callable(unindent):
+                unindent()
 
-        if self.state.transform_state_path:
-            imgui.text_wrapped(f"Transforms file: {self.state.transform_state_path}")
+        if imgui.collapsing_header("Profiling & Stats", imgui.TreeNodeFlags_.default_open):
+            if callable(indent):
+                indent()
+            imgui.text("Profiling")
+            profiler_available = self.renderer.is_profiler_available()
+            begin_disabled = getattr(imgui, "begin_disabled", None)
+            end_disabled = getattr(imgui, "end_disabled", None)
+            disabled_scope = not profiler_available and callable(begin_disabled) and callable(end_disabled)
+            if disabled_scope:
+                begin_disabled(True)
+            if imgui.button("Profile Next Frame"):
+                if self.renderer.request_profiler_capture():
+                    self.log("Queued torch.profiler capture for next frame")
+                else:
+                    self.log("Torch profiler unavailable; capture request ignored")
+            if disabled_scope:
+                end_disabled()
+                imgui.same_line()
+                imgui.text_disabled("torch.profiler unavailable")
+            elif not profiler_available:
+                imgui.text_disabled("torch.profiler unavailable")
 
-        imgui.separator()
-        imgui.text("Checkpoints:")
-        for ckpt in self.state.args.checkpoint:
-            imgui.text_wrapped(ckpt)
+            timings = self.state.profile_timings
+            if timings:
+                imgui.separator()
+                imgui.text("Render Timings")
+                imgui.text(f"Prepare: {timings.get('prepare', float('nan')):.2f} ms")
+                imgui.text(f"GS Render: {timings.get('render', float('nan')):.2f} ms")
+                imgui.text(f"Mesh Render: {timings.get('mesh', float('nan')):.2f} ms")
+                imgui.text(f"Shading: {timings.get('shading', float('nan')):.2f} ms")
+                imgui.text(f"Composite: {timings.get('composite', float('nan')):.2f} ms")
+                imgui.text(f"Total: {timings.get('total', float('nan')):.2f} ms")
+                if "gaussian_count" in timings:
+                    imgui.text(f"Gaussians: {int(timings['gaussian_count'])}")
+            else:
+                imgui.text("No timing data yet.")
+
+            if viewer_timings:
+                imgui.separator()
+                imgui.text("Viewer Timing")
+
+                def _fmt(key: str) -> str:
+                    value = viewer_timings.get(key)
+                    if value is None or not np.isfinite(value):
+                        return "--"
+                    return f"{value:.2f} ms"
+
+                imgui.text(f"Input: {_fmt('input')}")
+                imgui.text(f"Update Render: {_fmt('update_render')}")
+                imgui.text(f"Draw Controls: {_fmt('draw_control')}")
+                imgui.text(f"Draw Render: {_fmt('draw_render')}")
+                imgui.text(f"Image Display: {_fmt('image_display')}")
+                imgui.text(f"Frame (UI): {_fmt('frame')}")
+            if callable(unindent):
+                unindent()
+
+        if imgui.collapsing_header("Actions", imgui.TreeNodeFlags_.default_open):
+            if callable(indent):
+                indent()
+            if imgui.button("Render Once"):
+                self.renderer.update_render_buffer()
+                self.log("Render Once button pressed")
+            imgui.same_line()
+            if imgui.button("Save Transforms"):
+                self.state.save_transform_state()
+                self.log("Save Transforms button pressed")
+
+            if self.state.transform_state_path:
+                imgui.text_wrapped(f"Transforms file: {self.state.transform_state_path}")
+
+            imgui.separator()
+            imgui.text("Checkpoints:")
+            for ckpt in self.state.args.checkpoint:
+                imgui.text_wrapped(ckpt)
+            if callable(unindent):
+                unindent()
 
         imgui.end()
 
@@ -273,14 +305,18 @@ class ViewerUI:
             self._apply_gizmo_transform(np.ascontiguousarray(result_matrix.T))
 
     def _build_gizmo_matrix(self) -> np.ndarray:
-        trans = self.state.model_transforms[self.state.active_model_idx]
-        yaw = math.radians(float(trans["yaw"]))
-        pitch = math.radians(float(trans["pitch"]))
-        roll = math.radians(float(trans["roll"]))
+        trans, target_type, _ = self._get_gizmo_target_transform()
+        if trans is None:
+            return np.eye(4, dtype=np.float32)
+
+        yaw = math.radians(float(trans.get("yaw", 0.0)))
+        pitch = math.radians(float(trans.get("pitch", 0.0)))
+        roll = math.radians(float(trans.get("roll", 0.0)))
         rotation_user = euler_to_matrix(yaw, pitch, roll).astype(np.float32)
-        rotation_combined = rotation_user @ self._gizmo_base_rotation
-        scale = float(trans["scale"])
-        translation = np.array(trans["translation"], dtype=np.float32)
+        base_rot = self._gizmo_base_rotation if target_type == "model" else np.eye(3, dtype=np.float32)
+        rotation_combined = rotation_user @ base_rot
+        scale = float(trans.get("scale", 1.0))
+        translation = np.array(trans.get("translation", [0.0, 0.0, 0.0]), dtype=np.float32)
 
         matrix = np.eye(4, dtype=np.float32)
         matrix[:3, :3] = rotation_combined * scale
@@ -288,20 +324,29 @@ class ViewerUI:
         return np.ascontiguousarray(matrix.T)
 
     def _apply_gizmo_transform(self, matrix: np.ndarray) -> None:
+        trans, target_type, target_idx = self._get_gizmo_target_transform()
+        if trans is None:
+            return
+
         scale = float(np.linalg.norm(matrix[:3, 0]))
         scale = max(scale, 1e-6)
         rotation_combined = matrix[:3, :3] / scale
-        rotation_user = rotation_combined @ self._gizmo_base_rotation_inv
+        base_rot = self._gizmo_base_rotation if target_type == "model" else np.eye(3, dtype=np.float32)
+        base_rot_inv = self._gizmo_base_rotation_inv if target_type == "model" else np.eye(3, dtype=np.float32)
+        rotation_user = rotation_combined @ base_rot_inv
         yaw, pitch, roll = self._rotation_matrix_to_euler(rotation_user)
         translation = matrix[:3, 3]
 
-        trans = self.state.model_transforms[self.state.active_model_idx]
         trans["translation"] = translation.astype(np.float32).tolist()
         trans["scale"] = scale
         trans["yaw"] = math.degrees(yaw)
         trans["pitch"] = math.degrees(pitch)
         trans["roll"] = math.degrees(roll)
-        self.state.mark_model_dirty(self.state.active_model_idx)
+        if target_type == "model":
+            self.state.mark_model_dirty(target_idx)
+        else:
+            # Mesh data is transformed at render time; no cache to invalidate.
+            pass
 
     def _rotation_matrix_to_euler(self, rotation: np.ndarray) -> tuple[float, float, float]:
         trace = rotation[0, 0] + rotation[1, 1] + rotation[2, 2]
@@ -349,153 +394,212 @@ class ViewerUI:
         roll = yaw_z
         return yaw, pitch, roll
 
+    def _get_gizmo_target_transform(self) -> tuple[dict | None, str, int]:
+        if self._gizmo_target_type == "mesh":
+            groups = getattr(self.state, "mesh_group_transforms", [])
+            if not groups:
+                return None, "mesh", -1
+            idx = min(max(int(self._gizmo_target_mesh_idx), 0), len(groups) - 1)
+            self._gizmo_target_mesh_idx = idx
+            return groups[idx], "mesh", idx
+        return self.state.model_transforms[self.state.active_model_idx], "model", self.state.active_model_idx
+
     def _draw_transform_controls(self) -> None:
-        trans = self.state.model_transforms[self.state.active_model_idx]
+        trans, target_type, target_idx = self._get_gizmo_target_transform()
+        if trans is None:
+            imgui.text_disabled("No gizmo target available.")
+            return
+
+        # Target selector
+        options = [f"Model: {name}" for name in self.state.model_names]
+        mesh_labels = getattr(self.state, "mesh_group_names", [])
+        options.extend([f"Mesh: {label}" for label in mesh_labels])
+        current_idx = target_idx if target_type == "model" else len(self.state.model_names) + target_idx
+        if options:
+            changed, new_idx = imgui.combo("Gizmo Target", current_idx, options)
+            if changed:
+                if new_idx < len(self.state.model_names):
+                    self._gizmo_target_type = "model"
+                    self.state.active_model_idx = new_idx
+                else:
+                    self._gizmo_target_type = "mesh"
+                    self._gizmo_target_mesh_idx = new_idx - len(self.state.model_names)
+                trans, target_type, target_idx = self._get_gizmo_target_transform()
 
         def slider(label: str, field: str, min_v: float, max_v: float):
             changed, value = imgui.slider_float(label, trans[field], min_v, max_v)
             if changed:
                 trans[field] = value
-                self.state.mark_model_dirty(self.state.active_model_idx)
+                if target_type == "model":
+                    self.state.mark_model_dirty(self.state.active_model_idx)
                 self.log(f"{label} set to {value:.3f}")
 
-        imgui.text("Gizmo Operation")
-        if imgui.radio_button("Translate", self._gizmo_operation == self._gizmo.OPERATION.translate):
-            self._gizmo_operation = self._gizmo.OPERATION.translate
-        imgui.same_line()
-        if imgui.radio_button("Rotate", self._gizmo_operation == self._gizmo.OPERATION.rotate):
-            self._gizmo_operation = self._gizmo.OPERATION.rotate
-        imgui.same_line()
-        if imgui.radio_button("Scale", self._gizmo_operation == self._gizmo.OPERATION.scale):
-            self._gizmo_operation = self._gizmo.OPERATION.scale
+        if imgui.tree_node("Gizmo"):
+            if callable(imgui.indent):
+                imgui.indent()
+            imgui.text("Gizmo Operation")
+            if imgui.radio_button("Translate", self._gizmo_operation == self._gizmo.OPERATION.translate):
+                self._gizmo_operation = self._gizmo.OPERATION.translate
+            imgui.same_line()
+            if imgui.radio_button("Rotate", self._gizmo_operation == self._gizmo.OPERATION.rotate):
+                self._gizmo_operation = self._gizmo.OPERATION.rotate
+            imgui.same_line()
+            if imgui.radio_button("Scale", self._gizmo_operation == self._gizmo.OPERATION.scale):
+                self._gizmo_operation = self._gizmo.OPERATION.scale
+            if callable(imgui.unindent):
+                imgui.unindent()
+            imgui.tree_pop()
 
-        imgui.text("Model Orientation")
-        slider("Yaw (deg)", "yaw", -180.0, 180.0)
-        slider("Pitch (deg)", "pitch", -180.0, 180.0)
-        slider("Roll (deg)", "roll", -180.0, 180.0)
+        if imgui.tree_node("Model"):
+            if callable(imgui.indent):
+                imgui.indent()
+            imgui.text("Orientation")
+            slider("Yaw (deg)", "yaw", -180.0, 180.0)
+            slider("Pitch (deg)", "pitch", -180.0, 180.0)
+            slider("Roll (deg)", "roll", -180.0, 180.0)
 
-        imgui.separator()
-        imgui.text("Translation")
-        changed, translation = imgui.drag_float3("XYZ", trans["translation"], v_speed=0.01, format="%.3f")
-        if changed:
-            trans["translation"] = [float(v) for v in translation]
-            self.state.mark_model_dirty(self.state.active_model_idx)
-            self.log("Translation updated")
+            imgui.separator()
+            imgui.text("Translation")
+            changed, translation = imgui.drag_float3("XYZ", trans["translation"], v_speed=0.01, format="%.3f")
+            if changed:
+                trans["translation"] = [float(v) for v in translation]
+                if target_type == "model":
+                    self.state.mark_model_dirty(self.state.active_model_idx)
+                self.log("Translation updated")
 
-        imgui.separator()
-        changed, scale_value = imgui.slider_float("Uniform Scale", trans["scale"], 0.0001, 10.0, format="%.3f")
-        if changed:
-            trans["scale"] = max(scale_value, 1e-6)
-            self.state.mark_model_dirty(self.state.active_model_idx)
-            self.log(f"Uniform Scale set to {trans['scale']:.3f}")
+            changed, scale_value = imgui.slider_float("Uniform Scale", trans["scale"], 0.0001, 10.0, format="%.3f")
+            if changed:
+                trans["scale"] = max(scale_value, 1e-6)
+                if target_type == "model":
+                    self.state.mark_model_dirty(self.state.active_model_idx)
+                self.log(f"Uniform Scale set to {trans['scale']:.3f}")
+            if callable(imgui.unindent):
+                imgui.unindent()
+            imgui.tree_pop()
 
-        imgui.separator()
-        imgui.text("Bounding Box")
-        changed_min, bbox_min = imgui.drag_float3("BBox Min", trans["bbox_min"], v_speed=0.01, format="%.3f")
-        if changed_min:
-            trans["bbox_min"] = [float(v) for v in bbox_min]
-            self.state.ensure_bbox_consistency(trans)
-            self.state.mark_model_dirty(self.state.active_model_idx)
-            self.log("BBox Min updated")
-
-        changed_max, bbox_max = imgui.drag_float3("BBox Max", trans["bbox_max"], v_speed=0.01, format="%.3f")
-        if changed_max:
-            trans["bbox_max"] = [float(v) for v in bbox_max]
-            self.state.ensure_bbox_consistency(trans)
-            self.state.mark_model_dirty(self.state.active_model_idx)
-            self.log("BBox Max updated")
-
-        imgui.text("BBox Orientation")
-        for label, key in (("BBox Yaw", "bbox_yaw"), ("BBox Pitch", "bbox_pitch"), ("BBox Roll", "bbox_roll")):
-            current = float(trans.get(key, 0.0))
-            changed_angle, value_angle = imgui.slider_float(label, current, -180.0, 180.0)
-            if changed_angle:
-                trans[key] = float(value_angle)
+        if target_type == "model" and imgui.tree_node("Bounding Box"):
+            if callable(imgui.indent):
+                imgui.indent()
+            changed_min, bbox_min = imgui.drag_float3("BBox Min", trans["bbox_min"], v_speed=0.01, format="%.3f")
+            if changed_min:
+                trans["bbox_min"] = [float(v) for v in bbox_min]
+                self.state.ensure_bbox_consistency(trans)
                 self.state.mark_model_dirty(self.state.active_model_idx)
-                self.log(f"{label} updated to {value_angle:.2f}")
+                self.log("BBox Min updated")
+
+            changed_max, bbox_max = imgui.drag_float3("BBox Max", trans["bbox_max"], v_speed=0.01, format="%.3f")
+            if changed_max:
+                trans["bbox_max"] = [float(v) for v in bbox_max]
+                self.state.ensure_bbox_consistency(trans)
+                self.state.mark_model_dirty(self.state.active_model_idx)
+                self.log("BBox Max updated")
+
+            for label, key in (("BBox Yaw", "bbox_yaw"), ("BBox Pitch", "bbox_pitch"), ("BBox Roll", "bbox_roll")):
+                current = float(trans.get(key, 0.0))
+                changed_angle, value_angle = imgui.slider_float(label, current, -180.0, 180.0)
+                if changed_angle:
+                    trans[key] = float(value_angle)
+                    self.state.mark_model_dirty(self.state.active_model_idx)
+                    self.log(f"{label} updated to {value_angle:.2f}")
+            if callable(imgui.unindent):
+                imgui.unindent()
+            imgui.tree_pop()
 
     def _draw_environment_controls(self) -> None:
-        imgui.text("Environment")
-        if imgui.begin_combo("HDRI Preset", self.state.hdri_label_current):
-            for label in self.state.hdri_labels:
-                selected = label == self.state.hdri_label_current
-                if imgui.selectable(label, selected)[0] and not selected:
-                    self.state.hdri_label_current = label
-                    self.state.ensure_hdri(label)
-                    self.state.mark_all_models_dirty()
-                    self.log(f"HDRI preset set to {label}")
-                if selected:
-                    imgui.set_item_default_focus()
-            imgui.end_combo()
+        if imgui.tree_node("Environment Map"):
+            if callable(imgui.indent):
+                imgui.indent()
+            if imgui.begin_combo("HDRI Preset", self.state.hdri_label_current):
+                for label in self.state.hdri_labels:
+                    selected = label == self.state.hdri_label_current
+                    if imgui.selectable(label, selected)[0] and not selected:
+                        self.state.hdri_label_current = label
+                        self.state.ensure_hdri(label)
+                        self.state.mark_all_models_dirty()
+                        self.log(f"HDRI preset set to {label}")
+                    if selected:
+                        imgui.set_item_default_focus()
+                imgui.end_combo()
 
-        changed, rotation = imgui.slider_float("HDRI Yaw", self.state.hdri_rotation_deg, -180.0, 180.0, "%.1f deg")
-        if changed:
-            self.state.hdri_rotation_deg = rotation
-            self.log(f"HDRI yaw set to {rotation:.1f} degrees")
+            changed, rotation = imgui.slider_float("HDRI Yaw", self.state.hdri_rotation_deg, -180.0, 180.0, "%.1f deg")
+            if changed:
+                self.state.hdri_rotation_deg = rotation
+                self.log(f"HDRI yaw set to {rotation:.1f} degrees")
+            if callable(imgui.unindent):
+                imgui.unindent()
+            imgui.tree_pop()
 
-        imgui.separator()
-        imgui.text("Shading")
-        changed, tone_state = imgui.checkbox("ACES tone mapping", self.state.enable_tone)
-        if changed:
-            self.state.enable_tone = tone_state
-            self.log(f"ACES tone mapping {'enabled' if tone_state else 'disabled'}")
+        if imgui.tree_node("Shading"):
+            if callable(imgui.indent):
+                imgui.indent()
+            changed, tone_state = imgui.checkbox("ACES tone mapping", self.state.enable_tone)
+            if changed:
+                self.state.enable_tone = tone_state
+                self.log(f"ACES tone mapping {'enabled' if tone_state else 'disabled'}")
 
-        changed, gamma_state = imgui.checkbox("Gamma correction (sRGB)", self.state.enable_gamma)
-        if changed:
-            self.state.enable_gamma = gamma_state
-            self.log(f"Gamma correction {'enabled' if gamma_state else 'disabled'}")
+            changed, gamma_state = imgui.checkbox("Gamma correction (sRGB)", self.state.enable_gamma)
+            if changed:
+                self.state.enable_gamma = gamma_state
+                self.log(f"Gamma correction {'enabled' if gamma_state else 'disabled'}")
 
-        changed, env_bg_state = imgui.checkbox("HDRI as background", self.state.show_env_bg)
-        if changed:
-            self.state.show_env_bg = env_bg_state
-            self.log(f"HDRI background {'enabled' if env_bg_state else 'disabled'}")
+            changed, env_bg_state = imgui.checkbox("HDRI as background", self.state.show_env_bg)
+            if changed:
+                self.state.show_env_bg = env_bg_state
+                self.log(f"HDRI background {'enabled' if env_bg_state else 'disabled'}")
+            if callable(imgui.unindent):
+                imgui.unindent()
+            imgui.tree_pop()
 
-        imgui.separator()
-        imgui.text("Point Light")
-        point = self.state.point_light
-        changed_light, enabled = imgui.checkbox("Enable Point Light", point.enabled)
-        if changed_light:
-            point.enabled = enabled
-            self.log(f"Point light {'enabled' if enabled else 'disabled'}")
+        if imgui.tree_node("Point Light"):
+            if callable(imgui.indent):
+                imgui.indent()
+            point = self.state.point_light
+            changed_light, enabled = imgui.checkbox("Enable Point Light", point.enabled)
+            if changed_light:
+                point.enabled = enabled
+                self.log(f"Point light {'enabled' if enabled else 'disabled'}")
 
-        if point.enabled:
-            changed_pos, new_pos = imgui.drag_float3(
-                "Position", point.position, v_speed=0.01, format="%.3f"
-            )
-            if changed_pos:
-                point.position = [float(v) for v in new_pos]
-                self.state.mark_point_light_dirty()
-                self.log(f"Point light position set to {point.position}")
-
-            changed_intensity, new_intensity = imgui.drag_float3(
-                "Intensity", point.intensity, v_speed=1.0, format="%.2f"
-            )
-            if changed_intensity:
-                point.intensity = [max(0.0, float(v)) for v in new_intensity]
-                self.log("Point light intensity updated")
-
-            changed_shadow, shadow_state = imgui.checkbox("Cast Shadows", point.enable_shadow)
-            if changed_shadow:
-                point.enable_shadow = shadow_state
-                self.state.mark_point_light_dirty()
-                self.log(f"Point light shadows {'enabled' if shadow_state else 'disabled'}")
-
-            if point.enable_shadow:
-                shadow_res_options = [128, 256, 512, 1024, 2048]
-                if point.shadow_resolution not in shadow_res_options:
-                    shadow_res_options.append(point.shadow_resolution)
-                    shadow_res_options.sort()
-                current_idx = shadow_res_options.index(point.shadow_resolution)
-                labels = [f"{res}" for res in shadow_res_options]
-                changed_res, new_idx = imgui.combo("Shadow Resolution", current_idx, labels)
-                if changed_res and 0 <= new_idx < len(shadow_res_options):
-                    point.shadow_resolution = int(shadow_res_options[new_idx])
-                    self.state.mark_point_light_dirty()
-                    self.log(f"Point light shadow resolution set to {point.shadow_resolution}")
-
-                changed_bias, new_bias = imgui.drag_float(
-                    "Shadow Threshold", point.shadow_bias, v_speed=0.001, v_min=0.0, v_max=1.0, format="%.4f"
+            if point.enabled:
+                changed_pos, new_pos = imgui.drag_float3(
+                    "Position", point.position, v_speed=0.01, format="%.3f"
                 )
-                if changed_bias:
-                    point.shadow_bias = float(max(0.0, min(1.0, new_bias)))
-                    self.log(f"Point light shadow threshold set to {point.shadow_bias:.4f}")
+                if changed_pos:
+                    point.position = [float(v) for v in new_pos]
+                    self.state.mark_point_light_dirty()
+                    self.log(f"Point light position set to {point.position}")
+
+                changed_intensity, new_intensity = imgui.drag_float3(
+                    "Intensity", point.intensity, v_speed=1.0, format="%.2f"
+                )
+                if changed_intensity:
+                    point.intensity = [max(0.0, float(v)) for v in new_intensity]
+                    self.log("Point light intensity updated")
+
+                changed_shadow, shadow_state = imgui.checkbox("Cast Shadows", point.enable_shadow)
+                if changed_shadow:
+                    point.enable_shadow = shadow_state
+                    self.state.mark_point_light_dirty()
+                    self.log(f"Point light shadows {'enabled' if shadow_state else 'disabled'}")
+
+                if point.enable_shadow:
+                    shadow_res_options = [128, 256, 512, 1024, 2048]
+                    if point.shadow_resolution not in shadow_res_options:
+                        shadow_res_options.append(point.shadow_resolution)
+                        shadow_res_options.sort()
+                    current_idx = shadow_res_options.index(point.shadow_resolution)
+                    labels = [f"{res}" for res in shadow_res_options]
+                    changed_res, new_idx = imgui.combo("Shadow Resolution", current_idx, labels)
+                    if changed_res and 0 <= new_idx < len(shadow_res_options):
+                        point.shadow_resolution = int(shadow_res_options[new_idx])
+                        self.state.mark_point_light_dirty()
+                        self.log(f"Point light shadow resolution set to {point.shadow_resolution}")
+
+                    changed_bias, new_bias = imgui.drag_float(
+                        "Shadow Threshold", point.shadow_bias, v_speed=0.001, v_min=0.0, v_max=1.0, format="%.4f"
+                    )
+                    if changed_bias:
+                        point.shadow_bias = float(max(0.0, min(1.0, new_bias)))
+                        self.log(f"Point light shadow threshold set to {point.shadow_bias:.4f}")
+            if callable(imgui.unindent):
+                imgui.unindent()
+            imgui.tree_pop()
