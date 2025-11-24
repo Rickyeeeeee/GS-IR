@@ -80,11 +80,13 @@ class ViewerCamera(Camera):
 
 
     def update_canonical_rays(self):
+        tan_half_fovx = math.tan(0.5 * float(self.FoVx))
+        tan_half_fovy = math.tan(0.5 * float(self.FoVy))
         self.canonical_rays = get_canonical_rays(
             self.image_height,
             self.image_width,
-            self.FoVx,
-            self.FoVy
+            tan_half_fovx,
+            tan_half_fovy
         )
 
     def get_canonical_rays(self):

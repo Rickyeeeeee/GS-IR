@@ -578,7 +578,7 @@ class ViewerRenderer:
                 bg_color=state.background,
                 inference=True,
                 pad_normal=True,
-                derive_normal=True,
+                derive_normal=False,
                 argmax_depth=False
             )
             t_after_render = time.perf_counter()

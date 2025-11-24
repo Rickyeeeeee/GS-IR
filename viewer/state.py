@@ -402,18 +402,7 @@ class ViewerState:
         bg_mask = 1.0 - opacity_mask.permute(1, 2, 0).clamp(0.0, 1.0)
         return render_rgb * (1.0 - bg_mask) + env_rgb * bg_mask
 
-    def update_camera_resolution(self, width: int, height: int) -> bool:
-        width = max(1, int(width))
-        height = max(1, int(height))
-        if width == self.camera.image_width and height == self.camera.image_height:
-            return False
-
-        aspect = float(width) / float(height)
-        tan_half_y = float(self.camera.FoVy)
-        tan_half_x = tan_half_y * aspect
-        self.camera.FoVx = tan_half_x
-        self.camera.FoVy = tan_half_y
-
+    def _update_camera_projection_matrix(self) -> None:
         self.camera.projection_matrix = (
             getProjectionMatrix(
                 znear=self.camera.znear,
@@ -424,9 +413,44 @@ class ViewerState:
             .transpose(0, 1)
             .to(self.camera.data_device)
         )
+
+    def get_camera_fovx_degrees(self) -> float:
+        return math.degrees(float(self.camera.FoVx))
+
+    def set_camera_fovx_degrees(self, fovx_degrees: float) -> bool:
+        clamped = max(1.0, min(179.0, float(fovx_degrees)))
+        fovx_radians = math.radians(clamped)
+        if abs(fovx_radians - float(self.camera.FoVx)) < 1e-5:
+            return False
+
+        aspect = float(self.camera.image_width) / max(1.0, float(self.camera.image_height))
+        tan_half_x = math.tan(0.5 * fovx_radians)
+        tan_half_y = tan_half_x / max(aspect, 1e-6)
+        fovy_radians = 2.0 * math.atan(tan_half_y)
+
+        self.camera.FoVx = fovx_radians
+        self.camera.FoVy = fovy_radians
+        self._update_camera_projection_matrix()
+        self.camera.update_canonical_rays()
+        self.camera.update_matrices()
+        return True
+
+    def update_camera_resolution(self, width: int, height: int) -> bool:
+        width = max(1, int(width))
+        height = max(1, int(height))
+        if width == self.camera.image_width and height == self.camera.image_height:
+            return False
+
+        aspect = float(width) / float(height)
+        tan_half_x = math.tan(0.5 * float(self.camera.FoVx))
+        tan_half_y = tan_half_x / max(aspect, 1e-6)
+        self.camera.FoVy = 2.0 * math.atan(tan_half_y)
+
+        self._update_camera_projection_matrix()
         self.camera.image = torch.zeros((3, height, width), dtype=torch.float32)
         self.camera.original_image = self.camera.image.clone()
         self.camera.image_width = width
         self.camera.image_height = height
         self.camera.update_canonical_rays()
+        self.camera.update_matrices()
         return True

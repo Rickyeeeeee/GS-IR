@@ -89,6 +89,14 @@ class ViewerUI:
         )
 
         imgui.separator()
+        imgui.text("Camera")
+        current_fovx = self.state.get_camera_fovx_degrees()
+        changed_fov, new_fovx = imgui.slider_float("FoVx (deg)", current_fovx, 10.0, 170.0, "%.1f")
+        if changed_fov:
+            if self.state.set_camera_fovx_degrees(new_fovx):
+                self.log(f"Camera FoVx set to {new_fovx:.1f} deg")
+
+        imgui.separator()
         imgui.text("Profiling")
         profiler_available = self.renderer.is_profiler_available()
         begin_disabled = getattr(imgui, "begin_disabled", None)
