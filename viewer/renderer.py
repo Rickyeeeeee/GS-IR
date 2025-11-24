@@ -797,3 +797,8 @@ class ViewerRenderer:
         self.texture_backend.release()
         self._last_uploaded_shape = None
         self._image_dirty = True
+
+    def shutdown(self) -> None:
+        """Release GL/CUDA resources while the context is still alive."""
+        if self.texture_backend is not None:
+            self.texture_backend.release()

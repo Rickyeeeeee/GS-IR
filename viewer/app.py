@@ -21,6 +21,7 @@ class RelightViewer:
         self.viewer_timings: dict[str, float] = {}
         self.total_frames = 0
         self._last_frame_time = time.perf_counter()
+        self._shutdown = False
 
     def _log_input(self, message: str) -> None:
         print(f"[input] {message}", flush=True)
@@ -61,6 +62,13 @@ class RelightViewer:
 
         self.total_frames += 1
 
+    def shutdown(self) -> None:
+        """Release GPU resources before the GL context disappears."""
+        if self._shutdown:
+            return
+        self.renderer.shutdown()
+        self._shutdown = True
+
     def run(self):
         runner_params = hello_imgui.RunnerParams()
         runner_params.callbacks.show_gui = self.gui_frame
@@ -94,8 +102,22 @@ class RelightViewer:
             io.config_flags |= int(docking_flag)
 
         runner_params.callbacks.setup_imgui_config = setup_imgui_config
+        default_before_exit = getattr(runner_params.callbacks, "before_exit", None)
 
-        immapp.run(runner_params)
+        def before_exit() -> None:
+            self.shutdown()
+            if callable(default_before_exit):
+                default_before_exit()
+
+        try:
+            runner_params.callbacks.before_exit = before_exit
+        except AttributeError:
+            setattr(runner_params.callbacks, "before_exit", before_exit)
+
+        try:
+            immapp.run(runner_params)
+        finally:
+            self.shutdown()
 
 def run_viewer(args) -> None:
     RelightViewer(args).run()
