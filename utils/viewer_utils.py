@@ -88,6 +88,79 @@ def _sample_env_latlong(latlong_map: torch.Tensor, dirs: torch.Tensor) -> torch.
     sampled = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
     return sampled
 
+
+def _sample_env_cubemap(cubemap: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
+    """Sample a cubemap (6, H, W, C) using normalized directions."""
+    dirs = torch.nn.functional.normalize(dirs, p=2, dim=-1)
+    x, y, z = dirs.unbind(dim=-1)
+    abs_x, abs_y, abs_z = torch.abs(x), torch.abs(y), torch.abs(z)
+    max_axis = torch.argmax(torch.stack((abs_x, abs_y, abs_z), dim=-1), dim=-1)
+
+    face = torch.empty_like(max_axis)
+    face[max_axis == 0] = torch.where(x[max_axis == 0] >= 0, 0, 1)
+    face[max_axis == 1] = torch.where(y[max_axis == 1] >= 0, 2, 3)
+    face[max_axis == 2] = torch.where(z[max_axis == 2] >= 0, 4, 5)
+
+    eps = 1e-6
+    u = torch.zeros_like(x)
+    v = torch.zeros_like(x)
+
+    mask = face == 0  # +X
+    if mask.any():
+        ax = torch.clamp(abs_x[mask], min=eps)
+        u[mask] = -z[mask] / ax
+        v[mask] = -y[mask] / ax
+
+    mask = face == 1  # -X
+    if mask.any():
+        ax = torch.clamp(abs_x[mask], min=eps)
+        u[mask] = z[mask] / ax
+        v[mask] = -y[mask] / ax
+
+    mask = face == 2  # +Y
+    if mask.any():
+        ay = torch.clamp(abs_y[mask], min=eps)
+        u[mask] = x[mask] / ay
+        v[mask] = z[mask] / ay
+
+    mask = face == 3  # -Y
+    if mask.any():
+        ay = torch.clamp(abs_y[mask], min=eps)
+        u[mask] = x[mask] / ay
+        v[mask] = -z[mask] / ay
+
+    mask = face == 4  # +Z
+    if mask.any():
+        az = torch.clamp(abs_z[mask], min=eps)
+        u[mask] = x[mask] / az
+        v[mask] = -y[mask] / az
+
+    mask = face == 5  # -Z
+    if mask.any():
+        az = torch.clamp(abs_z[mask], min=eps)
+        u[mask] = -x[mask] / az
+        v[mask] = -y[mask] / az
+
+    grid = torch.stack((u, v), dim=-1)
+    out = torch.zeros((*dirs.shape[:2], cubemap.shape[-1]), device=cubemap.device, dtype=cubemap.dtype)
+    grid_4d = grid.unsqueeze(0)  # [1, H, W, 2] for grid_sample
+
+    for face_idx in range(6):
+        face_mask = face == face_idx
+        if not torch.any(face_mask):
+            continue
+        tex = cubemap[face_idx].permute(2, 0, 1).unsqueeze(0)  # [1, C, Hc, Wc]
+        sampled = F.grid_sample(
+            tex,
+            grid_4d,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )[0].permute(1, 2, 0)
+        out[face_mask] = sampled[face_mask]
+
+    return out
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -135,6 +208,28 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res_hw: List[int]) -> torch.Te
         texcoord = torch.cat((tu, tv), dim=-1)
         cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode="linear")[0]
     return cubemap
+
+
+def cubemap_to_latlong(cubemap: torch.Tensor, res_hw: List[int]) -> torch.Tensor:
+    """Convert a cubemap (6, H, W, C) into a latlong map [H_out, W_out, C]."""
+    H_out, W_out = res_hw
+    gy, gx = torch.meshgrid(
+        torch.linspace(0.0, 1.0, H_out, device=cubemap.device, dtype=cubemap.dtype, requires_grad=False),
+        torch.linspace(0.0, 1.0, W_out, device=cubemap.device, dtype=cubemap.dtype, requires_grad=False),
+        indexing="ij",
+    )
+    alpha = (gx - 0.5) * (2.0 * np.pi)
+    theta = gy * np.pi
+    sin_theta = torch.sin(theta)
+    dirs = torch.stack(
+        (
+            sin_theta * torch.sin(alpha),
+            torch.cos(theta),
+            -sin_theta * torch.cos(alpha),
+        ),
+        dim=-1,
+    )
+    return _sample_env_cubemap(cubemap, dirs)
 
 def tensor_to_dpg_rgba(img: torch.Tensor) -> np.ndarray:
     """Convert [H,W,3] float tensor in [0,1] to flattened RGBA float array for DearPyGui."""

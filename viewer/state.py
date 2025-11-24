@@ -4,7 +4,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -16,6 +16,7 @@ from utils.viewer_utils import (
     _aces_film,
     _linear_to_srgb,
     _sample_env_latlong,
+    cubemap_to_latlong,
     euler_to_matrix,
     get_canonical_rays,
     latlong_to_cubemap,
@@ -76,6 +77,7 @@ class ViewerState:
 
         self.models: List[GaussianModel] = []
         self.model_names: List[str] = []
+        self._checkpoint_cubemap = None
         self._load_models()
 
         self.render_gaussians = GaussianModel(args.sh_degree)
@@ -99,7 +101,12 @@ class ViewerState:
             )
         ).cuda()
 
-        self.hdri_presets: List[Tuple[str, str]] = []
+        self.hdri_presets: List[Tuple[str, Optional[str]]] = []
+        self.hdri_cubemap_data: Dict[str, torch.Tensor] = {}
+        if self._checkpoint_cubemap is not None:
+            label = "Checkpoint Cubemap"
+            self.hdri_presets.append((label, None))
+            self.hdri_cubemap_data[label] = self._checkpoint_cubemap
         if args.hdri_root and os.path.isdir(args.hdri_root):
             for label, filename in HDRI_PRESETS:
                 self.hdri_presets.append((label, os.path.join(args.hdri_root, filename)))
@@ -111,7 +118,7 @@ class ViewerState:
             raise ValueError("No HDRIs available. Provide --hdri or --hdri_root.")
 
         self.hdri_labels = [label for label, _ in self.hdri_presets]
-        self.hdri_paths = {label: path for label, path in self.hdri_presets}
+        self.hdri_paths: Dict[str, Optional[str]] = {label: path for label, path in self.hdri_presets}
         self.hdri_label_current = self._label_from_path(args.hdri) if args.hdri else self.hdri_labels[0]
         self.hdri_cache_latlong: Dict[str, torch.Tensor] = {}
         self.hdri_cache_cubemap: Dict[str, torch.Tensor] = {}
@@ -169,27 +176,51 @@ class ViewerState:
             model.restore(model_params)
             self.models.append(model)
             self.model_names.append(model_name)
+            if self._checkpoint_cubemap is None and isinstance(checkpoint, dict):
+                cubemap_state = checkpoint.get("cubemap")
+                if cubemap_state is not None:
+                    try:
+                        cubemap = CubemapLight(base_res=self.args.env_res).to(self.device)
+                        cubemap.load_state_dict(cubemap_state)
+                        cubemap.eval()
+                        cubemap.build_mips()
+                        self._checkpoint_cubemap = cubemap.base.data.detach().clone()
+                        print(f"[viewer] Loaded cubemap from checkpoint for HDRI presets.")
+                    except Exception as exc:
+                        print(f"[viewer] Warning: failed to load cubemap from checkpoint ({exc})")
 
     def _label_from_path(self, path: str | None) -> str:
         if not path:
             return self.hdri_labels[0]
         norm = os.path.normpath(path)
         for label, preset_path in self.hdri_presets:
+            if preset_path is None:
+                continue
             if os.path.normpath(preset_path) == norm:
                 return label
         return self.hdri_labels[0]
 
     def ensure_hdri(self, label: str) -> None:
         path = self.hdri_paths[label]
-        if label not in self.hdri_cache_latlong:
-            hdri_np = read_hdr(path)
-            self.hdri_cache_latlong[label] = torch.from_numpy(hdri_np).to(self.device)
-        latlong = self.hdri_cache_latlong[label]
+        if label in self.hdri_cubemap_data:
+            if label not in self.hdri_cache_cubemap:
+                self.hdri_cache_cubemap[label] = self.hdri_cubemap_data[label].to(self.device)
+            if label not in self.hdri_cache_latlong:
+                latlong_res = (self.args.env_res, self.args.env_res * 2)
+                self.hdri_cache_latlong[label] = cubemap_to_latlong(
+                    self.hdri_cache_cubemap[label], [latlong_res[0], latlong_res[1]]
+                )
+        else:
+            if label not in self.hdri_cache_latlong:
+                if path is None:
+                    raise ValueError(f"No HDRI path found for label '{label}'.")
+                hdri_np = read_hdr(path)
+                self.hdri_cache_latlong[label] = torch.from_numpy(hdri_np).to(self.device)
+            latlong = self.hdri_cache_latlong[label]
+            if label not in self.hdri_cache_cubemap:
+                self.hdri_cache_cubemap[label] = latlong_to_cubemap(latlong, [self.args.env_res, self.args.env_res])
 
-        if label not in self.hdri_cache_cubemap:
-            self.hdri_cache_cubemap[label] = latlong_to_cubemap(latlong, [self.args.env_res, self.args.env_res])
-
-        self.hdri = latlong
+        self.hdri = self.hdri_cache_latlong[label]
         self.light.base.data = self.hdri_cache_cubemap[label]
         self.light.build_mips()
 

@@ -3,6 +3,7 @@
     "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/backdoor_colmap/chkpnt40000.pth",
     "/workspace/work/Outputs/ITRI_Relighting_Demo/gsir/owl_colmap_masked/chkpnt40000.pth"],
   "hdri_root": "/workspace/data/Datasets/TensoIR_Synthetic/Environment_Maps/high_res_envmaps_1k/",
+  "hdr": "",
   "m": "",
   "s": "",
   "width": 1200,
