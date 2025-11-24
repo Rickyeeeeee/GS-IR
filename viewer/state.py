@@ -149,6 +149,7 @@ class ViewerState:
         self.mesh_group_names: List[str] = []
         self.mesh_group_transforms: List[Dict[str, float | List[float]]] = []
         self.mesh_segment_to_group: List[int] = []
+        self.mesh_group_paths: List[str] = []
         self._build_mesh_groups()
         self._point_shadow_cache: Dict[str, object] = {
             "depth_cubemap": None,
@@ -215,6 +216,7 @@ class ViewerState:
                 groups[src] = group_idx
                 label = os.path.basename(src) or f"Mesh {group_idx + 1}"
                 self.mesh_group_names.append(label)
+                self.mesh_group_paths.append(src)
                 self.mesh_group_transforms.append(TransformState().__dict__.copy())
             self.mesh_segment_to_group.append(groups[src])
 
@@ -249,6 +251,25 @@ class ViewerState:
             scene_dir = os.path.splitext(os.path.basename(abs_path))[0]
         return scene_dir
 
+    def _apply_saved_transform(self, trans: Dict[str, object], saved: Dict[str, object], include_bbox: bool = True) -> None:
+        trans["yaw"] = float(saved.get("yaw", trans["yaw"]))
+        trans["pitch"] = float(saved.get("pitch", trans["pitch"]))
+        trans["roll"] = float(saved.get("roll", trans["roll"]))
+        translation = saved.get("translation", trans["translation"])
+        if isinstance(translation, (list, tuple)) and len(translation) == 3:
+            trans["translation"] = [float(v) for v in translation]
+        trans["scale"] = max(1e-6, float(saved.get("scale", trans["scale"])))
+        if include_bbox:
+            bbox_min = saved.get("bbox_min")
+            if isinstance(bbox_min, (list, tuple)) and len(bbox_min) == 3:
+                trans["bbox_min"] = [float(v) for v in bbox_min]
+            bbox_max = saved.get("bbox_max")
+            if isinstance(bbox_max, (list, tuple)) and len(bbox_max) == 3:
+                trans["bbox_max"] = [float(v) for v in bbox_max]
+            trans["bbox_yaw"] = float(saved.get("bbox_yaw", trans["bbox_yaw"]))
+            trans["bbox_pitch"] = float(saved.get("bbox_pitch", trans["bbox_pitch"]))
+            trans["bbox_roll"] = float(saved.get("bbox_roll", trans["bbox_roll"]))
+
     def load_transform_state(self) -> None:
         if not os.path.isfile(self.transform_state_path):
             return
@@ -264,22 +285,30 @@ class ViewerState:
             if not isinstance(saved, dict):
                 continue
             trans = self.model_transforms[idx]
-            trans["yaw"] = float(saved.get("yaw", trans["yaw"]))
-            trans["pitch"] = float(saved.get("pitch", trans["pitch"]))
-            trans["roll"] = float(saved.get("roll", trans["roll"]))
-            translation = saved.get("translation", trans["translation"])
-            if isinstance(translation, (list, tuple)) and len(translation) == 3:
-                trans["translation"] = [float(v) for v in translation]
-            trans["scale"] = max(1e-6, float(saved.get("scale", trans["scale"])))
-            bbox_min = saved.get("bbox_min")
-            if isinstance(bbox_min, (list, tuple)) and len(bbox_min) == 3:
-                trans["bbox_min"] = [float(v) for v in bbox_min]
-            bbox_max = saved.get("bbox_max")
-            if isinstance(bbox_max, (list, tuple)) and len(bbox_max) == 3:
-                trans["bbox_max"] = [float(v) for v in bbox_max]
-            trans["bbox_yaw"] = float(saved.get("bbox_yaw", trans["bbox_yaw"]))
-            trans["bbox_pitch"] = float(saved.get("bbox_pitch", trans["bbox_pitch"]))
-            trans["bbox_roll"] = float(saved.get("bbox_roll", trans["bbox_roll"]))
+            self._apply_saved_transform(trans, saved, include_bbox=True)
+
+        mesh_saved = payload.get("mesh_groups", [])
+        if isinstance(mesh_saved, list) and self.mesh_group_transforms:
+            # match by source path first, then by name
+            path_to_idx = {os.path.normpath(p): i for i, p in enumerate(self.mesh_group_paths)}
+            name_to_idx = {name: i for i, name in enumerate(self.mesh_group_names)}
+            for entry in mesh_saved:
+                if not isinstance(entry, dict):
+                    continue
+                saved_trans = entry.get("transform")
+                if not isinstance(saved_trans, dict):
+                    continue
+                idx = None
+                path = entry.get("path")
+                if isinstance(path, str):
+                    idx = path_to_idx.get(os.path.normpath(path))
+                if idx is None:
+                    name = entry.get("name")
+                    if isinstance(name, str):
+                        idx = name_to_idx.get(name)
+                if idx is None or not (0 <= idx < len(self.mesh_group_transforms)):
+                    continue
+                self._apply_saved_transform(self.mesh_group_transforms[idx], saved_trans, include_bbox=False)
 
     def save_transform_state(self) -> None:
         checkpoint_data = {}
@@ -298,8 +327,24 @@ class ViewerState:
                 "bbox_roll": float(trans.get("bbox_roll", 0.0)),
             }
 
+        mesh_groups: List[Dict[str, object]] = []
+        for idx, trans in enumerate(self.mesh_group_transforms):
+            mesh_groups.append(
+                {
+                    "path": self.mesh_group_paths[idx] if idx < len(self.mesh_group_paths) else "",
+                    "name": self.mesh_group_names[idx] if idx < len(self.mesh_group_names) else f"Mesh {idx + 1}",
+                    "transform": {
+                        "yaw": float(trans["yaw"]),
+                        "pitch": float(trans["pitch"]),
+                        "roll": float(trans["roll"]),
+                        "translation": [float(v) for v in trans["translation"]],
+                        "scale": float(trans["scale"]),
+                    },
+                }
+            )
+
         with open(self.transform_state_path, "w", encoding="utf-8") as handle:
-            json.dump({"checkpoints": checkpoint_data}, handle, indent=2)
+            json.dump({"checkpoints": checkpoint_data, "mesh_groups": mesh_groups}, handle, indent=2)
         self._transform_state_cache = checkpoint_data
         print(f"[viewer] Saved transforms to {self.transform_state_path}")
 
