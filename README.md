@@ -6,32 +6,50 @@
 (Install conda, only tested on Ubuntu 22.04 with cuda 11.8 ).
 First clone the repository, than create the basic environment
 ```sh
-conda env create --file environment.yml
-conda activate gsir
+apt-get update && apt-get install -y \
+    libx11-dev \
+    libxrandr-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    libxi-dev \
+    libgl1-mesa-dev \
+    libglu1-mesa-dev \
+    freeglut3-dev
 
-pip install kornia
-```
+git clone https://github.com/Rickyeeeeee/GS-IR.git --recursive
+cd GS-IR
+git checkout -b viewer-imgui-bundle origin/viewer-imgui-bundle
+conda create --name gsir python=3.9 -y 
+conda activate gsir 
 
-install some extensions
-```sh
-cd gs-ir && python setup.py develop && cd ..
+conda install -c conda-forge -y plyfile trimesh Ninja matplotlib tqdm tensorboard "numpy<2" scipy=1.10
+pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118 
+cd gs-ir && pip install --no-build-isolation -e . develop && cd .. 
 
-cd submodules
-git clone https://github.com/NVlabs/nvdiffrast
-pip install ./nvdiffrast
-
-pip install ./simple-knn
-pip install ./diff-gaussian-rasterization # or cd ./diff-gaussian-rasterization && python setup.py develop && cd ../..
-pip install dearpygui
+cd submodules 
+git clone https://github.com/NVlabs/nvdiffrast 
+pip install ./nvdiffrast 
+pip install --no-build-isolation ./simple-knn 
+cd ./diff-gaussian-rasterization && pip install --no-build-isolation -e .  && cd ../.. 
+pip install trimesh imageio open3d kornia opencv-python==4.6.0.66 PyOpenGL
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+pip install imgui-bundle
+git submodule update --init --recursive
+cd ./submodules/pycuda
+python configure.py --cuda-enable-gl 
+python setup.py install 
 ```
 
 ## Demo
 ### 1. Download dataset and pretrained models
 Download contenets for the link: https://gofile.me/7fCAL/XSDwayhMN (password: cgvlab)
 - Dowload everything from the `Demo/` folder.
-### 2. Installation
+### 2. Download the example glb files
+Download contents from the link: https://gofile.me/7fCAL/XSDwayhMN (password: cgvlab)
+-Download everything from the `glb/` folder
+### 3. Installation
 Run the above installation.
-### 3. Run the viewer
+### 4. Run the viewer
 - Modify the paths of `config.json`:
 ```json
 {
@@ -46,13 +64,16 @@ Run the above installation.
   "tone": true,
   "gamma": true,
   "metallic": true,
-  "eval": true
+  "eval": true,
+  "mesh": [
+    "${Your folder}/glb/SheenChair.glb"
+  ]
 }
 
 ```
 - Run the following command:
 ```bash
-python pbr_viewer_demo.py --config config.json
+python imgui_bundle_viewer.py
 ```
 
 ## Dataset
